@@ -1,0 +1,15 @@
+{
+  "name": "md-to-pdf",
+  "version": "1.0.0",
+  "description": "HTTP trigger: markdown resume -> single-page PDF (Playwright + Chromium)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "func start",
+    "test": "echo \"No tests\" && exit 0"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.6.0",
+    "markdown-it": "^14.1.0",
+    "playwright-core": "^1.49.1"
+  }
+}
