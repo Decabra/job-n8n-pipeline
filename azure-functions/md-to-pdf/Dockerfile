@@ -13,7 +13,7 @@ WORKDIR /home/site/wwwroot
 
 COPY package.json package-lock.json ./
 RUN npm ci \
-  && npx playwright install chromium --with-deps
+  && npx playwright-core install chromium --with-deps
 
 COPY host.json .
 COPY src ./src

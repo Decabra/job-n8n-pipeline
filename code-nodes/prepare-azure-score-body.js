@@ -48,10 +48,12 @@ STEP 2 — Score the job on these dimensions (each score must be an integer; sub
    - A sparse but legitimate JD with some detail = 4-6.
    - Vague, spammy, or fake-looking postings = 0-3.
 
-6. career_trajectory (0-10): Does this role advance the candidate's career in AI/LLM/agent engineering?
-   - Roles centered on AI agents, LLMs, RAG, ML engineering, or applied AI = 7-10.
-   - Roles that are pure Data Engineering, BI/Analytics, DevOps, or traditional backend with no AI component = 0-3 (these pull AWAY from the candidate's strongest trajectory).
-   - Adjacent roles with some AI overlap = 4-6.
+6. career_trajectory (0-10): Does this role keep the candidate on a viable engineering path? Two paths are viable: (a) the candidate's strongest current trajectory in AI/LLM/agent engineering, and (b) the candidate's secondary trajectory in data engineering / data platform / ML infrastructure — they hold a degree and prior professional experience in this area, so DE-family roles are a legitimate lateral, not a regression.
+   - Roles centered on AI agents, LLMs, RAG, ML engineering, agentic systems, or applied AI = 8-10 (matches the strongest trajectory).
+   - Roles in data engineering, data platform, ML infrastructure, MLOps, analytics engineering, or backend systems that meaningfully use Python/SQL/pipelines/cloud and where the candidate's DE background applies = 5-7 (viable lateral; uses core skills; does NOT pull away).
+   - Adjacent backend/full-stack roles with some AI or data overlap = 4-6.
+   - Pure BI dashboarding, traditional support/IT/devops with no software depth, sales engineering, or roles outside software engineering entirely = 0-3 (genuinely off-path).
+   IMPORTANT: do NOT penalize a role for being "data engineering instead of AI" — score it on its own merits within the DE family. Only score 0-3 if the role is genuinely outside the candidate's two viable paths.
 
 fit_score must equal role_alignment + skill_overlap + title_seniority_fit + visa_safety + posting_quality + career_trajectory (max 100).
 

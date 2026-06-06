@@ -20,31 +20,84 @@ import crypto from 'crypto';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (f) => fs.readFileSync(path.join(__dirname, 'code-nodes', f), 'utf8');
 
+function parseDotEnv(src) {
+  const out = {};
+  for (const rawLine of String(src || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (!key) continue;
+
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    // Allow multi-line-ish values in .env via escaped sequences.
+    value = value
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '\t');
+
+    out[key] = value;
+  }
+  return out;
+}
+
+const envPath = path.join(__dirname, '.env');
+const fileEnv = fs.existsSync(envPath) ? parseDotEnv(fs.readFileSync(envPath, 'utf8')) : {};
+const ENV = { ...fileEnv, ...process.env };
+const E = (key, fallback = '') => {
+  const value = ENV[key];
+  return value === undefined || value === null || value === '' ? fallback : String(value);
+};
+
 // Shared status constants — prepended to code nodes that reference S.* / FROZEN_STATUSES / etc.
 const STATUS_PREAMBLE = read('_statuses.js');
 const withS = (src) => STATUS_PREAMBLE + '\n' + src;
+
+const BLOCKED_DOMAINS_PREAMBLE = read('_blocked-job-domains.js');
+const withBlocked = (src) => BLOCKED_DOMAINS_PREAMBLE + '\n' + src;
+const blockedDomainsCtx = new Function(
+  `${BLOCKED_DOMAINS_PREAMBLE}; return { BLOCKED_JOB_DOMAINS, BLOCKED_URL_DOMAIN_NOT, JSEARCH_EXCLUDED_PUBLISHERS };`,
+)();
+const BLOCKED_JOB_DOMAINS = blockedDomainsCtx.BLOCKED_JOB_DOMAINS;
+const BLOCKED_URL_DOMAIN_NOT = blockedDomainsCtx.BLOCKED_URL_DOMAIN_NOT;
+const JSEARCH_EXCLUDED_PUBLISHERS = blockedDomainsCtx.JSEARCH_EXCLUDED_PUBLISHERS;
 
 const SRC = {
   explode:       read('explode-jsearch.js'),
   explodeApify:  read('explode-apify-dataset.js'),
   explodeTheirstack: read('explode-theirstack.js'),
   normalize:     read('normalize-job.js'),
-  normApify:     read('normalize-apify.js'),
-  mergeScrapedJd: read('merge-scraped-jd.js'),
+  normFantastic: read('normalize-fantastic-jobs.js'),
   normTheirstack: read('normalize-theirstack.js'),
   normManualUrl: read('normalize-manual-url-job.js'),
   normManualPaste: read('normalize-manual-jd-paste.js'),
-  filterStale:   read('filter-stale-jobs.js'),
-  dedupeIncoming: read('dedupe-incoming-jobs.js'),
   sourceExclusions: read('build-source-exclusions.js'),
-  prefetchDedup: read('prefetch-airtable-duplicates.js'),
-  mergeDedup:    read('merge-dedup.js'),
-  safeUpdate:    read('safe-airtable-update.js'),
+  filterFantastic: read('filter-fantastic-exploded.js'),
+  filterIncoming: withBlocked(read('filter-and-dedupe-incoming.js')),
+  deserializeFetched: read('deserialize-fetched-payloads.js'),
+  restoreBucketPayload: read('restore-bucket-payload.js'),
+  pullStaleFetched: read('pull-stale-fetched.js'),
+  indexFetched: read('index-all-fetched-jobs.js'),
+  markIndexProcessed: read('mark-index-processed.js'),
+
   prepScore:     read('prepare-azure-score-body.js'),
   parseScore:    read('parse-fit-score.js'),
   scoreBucket:   read('score-bucket.js'),
   prepTailor:    read('prepare-azure-tailor-body.js'),
   parseTailor:   read('parse-tailor-response.js'),
+  prepCoverLetter:  read('prepare-azure-cover-letter-body.js'),
+  parseCoverLetter: read('parse-cover-letter-response.js'),
+  convertCoverLetterPdf: read('convert-cover-letter-pdf.js'),
   buildPacket:   read('build-packet-text.js'),
   prepMetaBin:   read('prepare-binary-metadata.js'),
   prepJdBin:     read('prepare-binary-jd.js'),
@@ -103,6 +156,18 @@ function AT(name, pos, operation, extra = {}, nodeExtra = {}) {
   }, nodeExtra);
 }
 
+// ── Airtable helper for the Source Job Index table ──
+// Used by Workflow A to track every TheirStack job_id we've ever fetched
+// (regardless of outcome) so the next request's `job_id_not` is comprehensive.
+function ATIdx(name, pos, operation, extra = {}, nodeExtra = {}) {
+  return N(name, 'n8n-nodes-base.airtable', 2.1, pos, {
+    operation,
+    base:  { __rl: true, value: C('airtable_base_id'), mode: 'id' },
+    table: { __rl: true, value: C('airtable_source_index_table_name'), mode: 'name' },
+    ...extra,
+  }, nodeExtra);
+}
+
 // ── Azure Blob upload (Shared Key credential on each node after import) ──
 function ABU(name, pos, blobCreateExpr) {
   return N(name, 'n8n-nodes-base.azureStorage', 1, pos, {
@@ -148,27 +213,39 @@ function build00() {
     }),
     N('Config', 'n8n-nodes-base.set', 3.4, [220, 200], {
       assignments: { assignments: [
-        { id: 'c0',  name: 'airtable_base_id',        value: 'YOUR_AIRTABLE_BASE_ID',    type: 'string' },
-        { id: 'c0b', name: 'airtable_table_name',     value: 'Jobs Application Tracker',  type: 'string' },
-        { id: 'c0c', name: 'airtable_pat',            value: 'YOUR_AIRTABLE_PAT',         type: 'string' },
-        { id: 'c0d', name: 'airtable_schema_cache_ttl_seconds', value: '86400', type: 'string' },
-        { id: 'c1',  name: 'telegram_bot_token',      value: 'YOUR_TELEGRAM_BOT_TOKEN',  type: 'string' },
-        { id: 'c2',  name: 'telegram_chat_id',        value: 'YOUR_TELEGRAM_CHAT_ID',    type: 'string' },
-        { id: 'c3a', name: 'azure_storage_account',   value: 'YOUR_STORAGE_ACCOUNT_NAME', type: 'string' },
-        { id: 'c3b', name: 'azure_storage_container', value: 'job-applications',         type: 'string' },
-        { id: 'c4',  name: 'azure_openai_resource',   value: 'YOUR_AZURE_ENDPOINT_URL',  type: 'string' },
-        { id: 'c5',  name: 'azure_openai_deployment', value: 'YOUR_DEPLOYMENT_NAME',     type: 'string' },
-        { id: 'c5b', name: 'azure_openai_api_version', value: 'YOUR_AZURE_OPENAI_API_VERSION', type: 'string' },
-        { id: 'c6',  name: 'azure_openai_api_key',    value: 'YOUR_AZURE_API_KEY',       type: 'string' },
-        { id: 'c7',  name: 'rapidapi_key',            value: 'YOUR_RAPIDAPI_KEY',        type: 'string' },
-        { id: 'c7j', name: 'job_search_queries',      value: 'YOUR_SEARCH_QUERIES', type: 'string' },
-        { id: 'c7a', name: 'apify_token',             value: 'YOUR_APIFY_TOKEN',         type: 'string' },
-        { id: 'c7v', name: 'theirstack_api_key',      value: 'YOUR_THEIRSTACK_API_KEY',  type: 'string' },
-        { id: 'c7w', name: 'theirstack_limit',        value: '10',                     type: 'string' },
-        { id: 'c8',  name: 'base_resume_text',        value: 'PASTE_YOUR_FULL_RESUME_HERE', type: 'string' },
-        { id: 'c9',  name: 'submission_workflow_id',   value: 'YOUR_WORKFLOW_C_ID',       type: 'string' },
-        { id: 'c9p', name: 'pdf_converter_url',        value: 'YOUR_AZURE_MD_TO_PDF_URL_WITH_CODE', type: 'string' },
-        { id: 'c9r', name: 'resume_pdf_filename',       value: 'tailored_resume.pdf',    type: 'string' },
+        { id: 'c0',  name: 'airtable_base_id',        value: E('AIRTABLE_BASE_ID', 'YOUR_AIRTABLE_BASE_ID'),    type: 'string' },
+        { id: 'c0b', name: 'airtable_table_name',     value: E('AIRTABLE_TABLE_NAME', 'Jobs Application Tracker'),  type: 'string' },
+        { id: 'c0e', name: 'airtable_source_index_table_name', value: E('AIRTABLE_SOURCE_INDEX_TABLE_NAME', 'Source Job Index'), type: 'string' },
+        // How far back to read the Source Job Index for prefetch exclusions.
+        // 30 days is well past the freshness window of any job source we use
+        // (all configured to ≤1 day), so anything older can never reappear.
+        // Keeping this windowed prevents the prefetch read from ballooning
+        // as the index grows over months.
+        { id: 'c0f', name: 'source_index_lookback_days', value: E('SOURCE_INDEX_LOOKBACK_DAYS', '30'), type: 'string' },
+        { id: 'c0c', name: 'airtable_pat',            value: E('AIRTABLE_PAT', 'YOUR_AIRTABLE_PAT'),         type: 'string' },
+        { id: 'c0d', name: 'airtable_schema_cache_ttl_seconds', value: E('AIRTABLE_SCHEMA_CACHE_TTL_SECONDS', '86400'), type: 'string' },
+        { id: 'c1',  name: 'telegram_bot_token',      value: E('TELEGRAM_BOT_TOKEN', 'YOUR_TELEGRAM_BOT_TOKEN'),  type: 'string' },
+        { id: 'c2',  name: 'telegram_chat_id',        value: E('TELEGRAM_CHAT_ID', 'YOUR_TELEGRAM_CHAT_ID'),    type: 'string' },
+        { id: 'c3a', name: 'azure_storage_account',   value: E('AZURE_STORAGE_ACCOUNT', 'YOUR_STORAGE_ACCOUNT_NAME'), type: 'string' },
+        { id: 'c3b', name: 'azure_storage_container', value: E('AZURE_STORAGE_CONTAINER', 'job-applications'),         type: 'string' },
+        { id: 'c4',  name: 'azure_openai_resource',   value: E('AZURE_OPENAI_RESOURCE', 'YOUR_AZURE_ENDPOINT_URL'),  type: 'string' },
+        { id: 'c5',  name: 'azure_openai_deployment', value: E('AZURE_OPENAI_DEPLOYMENT', 'YOUR_DEPLOYMENT_NAME'),     type: 'string' },
+        { id: 'c5b', name: 'azure_openai_api_version', value: E('AZURE_OPENAI_API_VERSION', 'YOUR_AZURE_OPENAI_API_VERSION'), type: 'string' },
+        { id: 'c6',  name: 'azure_openai_api_key',    value: E('AZURE_OPENAI_API_KEY', 'YOUR_AZURE_API_KEY'),       type: 'string' },
+        { id: 'c7',  name: 'rapidapi_key',            value: E('RAPIDAPI_KEY', 'YOUR_RAPIDAPI_KEY'),        type: 'string' },
+        { id: 'c7j', name: 'job_search_queries',      value: E('JOB_SEARCH_QUERIES', 'YOUR_SEARCH_QUERIES'), type: 'string' },
+        { id: 'c7a', name: 'apify_token',             value: E('APIFY_TOKEN', 'YOUR_APIFY_TOKEN'),         type: 'string' },
+        { id: 'c7v', name: 'theirstack_api_key',      value: E('THEIRSTACK_API_KEY', 'YOUR_THEIRSTACK_API_KEY'),  type: 'string' },
+        { id: 'c7w', name: 'theirstack_limit',        value: E('THEIRSTACK_LIMIT', '10'),                     type: 'string' },
+        { id: 'c7x', name: 'fantastic_jobs_limit',    value: E('FANTASTIC_JOBS_LIMIT', '50'),                     type: 'string' },
+        { id: 'c8',  name: 'base_resume_text',        value: E('BASE_RESUME_TEXT', 'PASTE_YOUR_FULL_RESUME_HERE'), type: 'string' },
+        { id: 'c8a', name: 'candidate_name',          value: E('CANDIDATE_NAME', 'YOUR_NAME'),                 type: 'string' },
+        { id: 'c8b', name: 'candidate_contact_line',  value: E('CANDIDATE_CONTACT_LINE', 'email · phone · LinkedIn URL'), type: 'string' },
+        { id: 'c9',  name: 'submission_workflow_id',   value: E('SUBMISSION_WORKFLOW_ID', 'YOUR_WORKFLOW_C_ID'),       type: 'string' },
+        { id: 'c9s', name: 'scoring_workflow_id',      value: E('SCORING_WORKFLOW_ID', 'YOUR_WORKFLOW_02_SCORING_ID'), type: 'string' },
+        { id: 'c9p', name: 'pdf_converter_url',        value: E('PDF_CONVERTER_URL', 'YOUR_AZURE_MD_TO_PDF_URL_WITH_CODE'), type: 'string' },
+        { id: 'c9r', name: 'resume_pdf_filename',       value: E('RESUME_PDF_FILENAME', 'tailored_resume.pdf'),    type: 'string' },
+        { id: 'c9c', name: 'cover_letter_pdf_filename', value: E('COVER_LETTER_PDF_FILENAME', 'Cover_Letter.pdf'),       type: 'string' },
       ]},
       options: {},
     }),
@@ -183,18 +260,42 @@ function build00() {
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// WORKFLOW A — Source → Score → Package
+// WORKFLOW 01 — Job Sourcing (fetch → merge → dedupe → Source Job Index)
 // ═══════════════════════════════════════════════════════════════════════
-// STATUS STRINGS in n8n node parameters below (e.g. 'AWAITING_APPROVAL',
-// 'READY_TO_SUBMIT') MUST match code-nodes/_statuses.js.
-// n8n expressions can't reference JS vars, so these stay as literals.
+// Ends at Index All Fetched Jobs (FETCHED + payload_json in Source Job Index).
+// Workflow 02 runs independently and reads those rows. STATUS STRINGS in
+// Workflow 02 nodes MUST match code-nodes/_statuses.js.
 // ═══════════════════════════════════════════════════════════════════════
-function buildA() {
-  const cfg = configLoader([200, 200]);
+function buildSourcing() {
+  // ── Layout grid (keep n8n canvas tidy on import) ──────────────────────
+  // Same grid as the old monolithic A (sources + merge + filter + index).
+  // Horizontal stride 220px; vertical lanes keep multi-source branches readable.
+  //
+  // Vertical lanes (top → bottom):
+  //   LANE_TOP   100  JSearch source row
+  //   LANE_CFG   200  Fetch Config + Config (col 1–2 only)
+  //   IF_TOP     240  JSearch + Fantastic merge anchor column
+  //   LANE_TRIG  300  Manual Test trigger (col 0 only)
+  //   LANE_MAIN  380  Fantastic row + merge / filter / index (terminal)
+  //   FANT_TOP   460  Fantastic.jobs "has dataset" branch
+  //   IF_BOT     520  Apify "no dataset" skip branch + Fantastic main row
+  //   FANT_BOT   580  Fantastic.jobs "no dataset" skip branch
+  //   LANE_BOT   660  TheirStack source + Source-Index prefetch row
+  //   LANE_STALE 800  Pull Stale FETCHED retry branch (4th source)
+  //
+  // Horizontal columns: 220 px stride from x=0. Each column owns one
+  // "step" of the chain so vertical alignment across lanes is automatic.
+  const COL = (i) => i * 220;
+  const Y = {
+    TOP: 100, CFG: 200, IF_TOP: 240, TRIG: 300,
+    MAIN: 380, FANT_TOP: 460, IF_BOT: 520, FANT_BOT: 580, BOT: 660, STALE: 800, WRAP: 880,
+  };
+
+  const cfg = configLoader([COL(1), Y.CFG]);
 
   const nodes = [
-    N('Manual Test', 'n8n-nodes-base.manualTrigger', 1, [0, 300], {}),
-    N('Twice daily ET', 'n8n-nodes-base.scheduleTrigger', 1.2, [0, 100], {
+    N('Manual Test', 'n8n-nodes-base.manualTrigger', 1, [COL(0), Y.TRIG], {}),
+    N('Twice daily ET', 'n8n-nodes-base.scheduleTrigger', 1.2, [COL(0), Y.TOP], {
       rule: {
         interval: [{ field: 'cronExpression', expression: '0 13,19 * * *' }],
       },
@@ -202,7 +303,7 @@ function buildA() {
     }, { notes: 'Runs 13:00 and 19:00 US Eastern (10:00 and 16:00 Pacific).', notesInFlow: true }),
     ...cfg.nodes,
 
-    N('JSearch API', 'n8n-nodes-base.httpRequest', 4.2, [640, 140], {
+    N('JSearch API', 'n8n-nodes-base.httpRequest', 4.2, [COL(3), Y.TOP], {
       method: 'GET',
       url: 'https://jsearch.p.rapidapi.com/search',
       sendQuery: true,
@@ -211,6 +312,7 @@ function buildA() {
         { name: 'page', value: '1' },
         { name: 'num_pages', value: '3' },
         { name: 'date_posted', value: 'today' },
+        { name: 'exclude_job_publishers', value: JSEARCH_EXCLUDED_PUBLISHERS.join(',') },
       ]},
       sendHeaders: true,
       headerParameters: { parameters: [
@@ -220,53 +322,52 @@ function buildA() {
       options: { timeout: 120000 },
     }),
 
-    N('Apify Job Pulse', 'n8n-nodes-base.httpRequest', 4.2, [640, 420], {
+    // Fantastic.jobs' indexed career-site API: `date_posted` plus plain-text
+    // descriptions suitable for scoring without an extra JD scrape hop.
+    N('Fantastic Jobs API', 'n8n-nodes-base.httpRequest', 4.2, [COL(3), Y.IF_BOT], {
       method: 'POST',
-      url: `={{ 'https://api.apify.com/v2/acts/myro-e54de05da1~job-pulse/runs?waitForFinish=180&token=' + encodeURIComponent($('Config').first().json.apify_token || '') }}`,
+      url: `={{ 'https://api.apify.com/v2/acts/fantastic-jobs~career-site-job-listing-api/runs?waitForFinish=180&token=' + encodeURIComponent($('Config').first().json.apify_token || '') }}`,
       sendBody: true,
       specifyBody: 'json',
-      jsonBody: `={{ JSON.stringify({ query: $('Config').first().json.job_search_queries || 'software engineer', location: 'United States', postedWithinDays: 1, maxResultsPerSource: 30, forceFresh: true, country: 'US' }) }}`,
+      jsonBody: `={{ JSON.stringify({ timeRange: '24h', limit: Math.max(10, Number($('Config').first().json.fantastic_jobs_limit || 50)), includeAi: true, descriptionType: 'text', removeAgency: true, domainExclusionFilter: ${JSON.stringify(BLOCKED_JOB_DOMAINS)}, organizationExclusionSearch: ['beBee:*', 'recruit.net', 'JobLeads:*'], titleSearch: ['AI engineer', 'ML engineer', 'LLM engineer', 'machine learning engineer', 'applied AI', 'agent engineer', 'gen AI', 'AI platform', 'data engineer', 'software engineer', 'backend engineer'], titleExclusionSearch: ['staff', 'principal', 'director', 'VP', 'head of', 'lead', 'distinguished', 'intern', 'co op'], descriptionExclusionSearch: ['security clearance', 'TS/SCI', 'polygraph', 'Public Trust', 'US citizens only', 'must be a US citizen', 'citizenship required', 'no visa sponsorship', 'without sponsorship', 'without current or future sponsorship'], aiExperienceLevelFilter: ['0-2', '2-5'], locationSearch: ['United States'], idExclusionFilter: $('Build Source Exclusions').first().json.fantastic_job_id_not || [] }) }}`,
       options: { timeout: 300000 },
-    }),
-    N('IF Apify Dataset', 'n8n-nodes-base.if', 2.2, [860, 420], {
+    }, { onError: 'continueRegularOutput', alwaysOutputData: true }),
+    N('IF Fantastic Dataset', 'n8n-nodes-base.if', 2.2, [COL(4), Y.IF_BOT], {
       conditions: { options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
-        conditions: [{ id: 'ad', leftValue: '={{ $json.data.defaultDatasetId }}', rightValue: '',
+        conditions: [{ id: 'fd', leftValue: '={{ $json.data.defaultDatasetId }}', rightValue: '',
           operator: { type: 'string', operation: 'notEmpty' } }],
         combinator: 'and' },
     }),
-    N('Apify Fetch Dataset', 'n8n-nodes-base.httpRequest', 4.2, [1120, 340], {
+    N('Fantastic Fetch Dataset', 'n8n-nodes-base.httpRequest', 4.2, [COL(5), Y.FANT_TOP], {
       method: 'GET',
       url: `={{ 'https://api.apify.com/v2/datasets/' + $json.data.defaultDatasetId + '/items?clean=true&token=' + encodeURIComponent($('Config').first().json.apify_token || '') }}`,
       options: { timeout: 120000 },
     }),
-    codeAll('Apify Skip No Dataset', [1120, 500], 'return [{ json: { _apify_skip: true } }];'),
-    codeAll('Explode Apify Dataset', [1340, 420], SRC.explodeApify, { alwaysOutputData: true }),
-    code('Normalize Apify Jobs', [1520, 420], SRC.normApify, 'runOnceForEachItem', { alwaysOutputData: true }),
-    N('Scrape Apify JDs', 'n8n-nodes-base.httpRequest', 4.2, [1700, 420], {
-      method: 'GET',
-      url: '={{ $json.application_url || $json.job_url }}',
-      options: { timeout: 15000, redirect: { redirect: { maxRedirects: 3 } }, batching: { batch: { batchSize: 3, batchInterval: 500 } } },
-      sendHeaders: true,
-      headerParameters: { parameters: [
-        { name: 'User-Agent', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
-        { name: 'Accept', value: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
-      ]},
-      responseFormat: 'text',
-    }, { onError: 'continueRegularOutput', alwaysOutputData: true }),
-    codeAll('Merge Scraped JDs', [1880, 420], SRC.mergeScrapedJd, { alwaysOutputData: true }),
+    codeAll('Fantastic Skip No Dataset', [COL(5), Y.FANT_BOT], 'return [{ json: { _apify_skip: true } }];'),
+    codeAll('Explode Fantastic Dataset', [COL(6), Y.IF_BOT], SRC.explodeApify, { alwaysOutputData: true }),
+    codeAll('Filter Fantastic Prefilter', [COL(6.5), Y.IF_BOT], SRC.filterFantastic, { alwaysOutputData: true }),
+    code('Normalize Fantastic Jobs', [COL(7), Y.IF_BOT], SRC.normFantastic, 'runOnceForEachItem', { alwaysOutputData: true }),
 
-    codeAll('Seed Source Exclusions Prefetch', [640, 700], 'return [{ json: { prefetch_source_ids: true } }];'),
-    // Separate list call used BEFORE TheirStack API request so we can pass job_id_not.
-    AT(
-      'Airtable List Existing (Source Exclusions)',
-      [860, 700],
+    codeAll('Seed Source Exclusions Prefetch', [COL(3), Y.BOT], 'return [{ json: { prefetch_source_ids: true } }];'),
+    // Source Job Index — comprehensive superset of every job_id we've ever
+    // fetched from any source (jsearch, apify, theirstack, future ones).
+    // Filtered to the configured lookback window so this read stays cheap
+    // even after months of accumulation; older entries can't reappear anyway
+    // because every source API filters to ≤1 day of postings.
+    ATIdx(
+      'Airtable List Source Job Index',
+      [COL(4), Y.BOT],
       'search',
-      { returnAll: true, options: {} },
+      {
+        returnAll: true,
+        filterByFormula: `={{ "IS_AFTER({date_fetched}, DATEADD(TODAY(), -" + Math.max(1, Number($('Config').first().json.source_index_lookback_days || '30')) + ", 'days'))" }}`,
+        options: {},
+      },
       { alwaysOutputData: true },
     ),
-    codeAll('Build Source Exclusions', [1080, 700], SRC.sourceExclusions, { alwaysOutputData: true }),
+    codeAll('Build Source Exclusions', [COL(5), Y.BOT], SRC.sourceExclusions, { alwaysOutputData: true }),
 
-    N('TheirStack Jobs API', 'n8n-nodes-base.httpRequest', 4.2, [1300, 700], {
+    N('TheirStack Jobs API', 'n8n-nodes-base.httpRequest', 4.2, [COL(6), Y.BOT], {
       method: 'POST',
       url: 'https://api.theirstack.com/v1/jobs/search',
       sendHeaders: true,
@@ -277,51 +378,122 @@ function buildA() {
       ]},
       sendBody: true,
       specifyBody: 'json',
-      jsonBody: `={{ JSON.stringify({ page: 0, limit: Number($('Config').first().json.theirstack_limit || 10), posted_at_max_age_days: 1, job_country_code_or: ['US'], job_seniority_or: ['junior', 'mid_level'], job_title_pattern_or: ['AI.engineer', 'ML.engineer', 'LLM.engineer', 'machine.learning.engineer', 'data.engineer', 'software.engineer'], job_title_pattern_not: ['staff', 'principal', 'director', 'VP', 'head.of', 'intern', 'co.op'], job_description_pattern_or: ['LLM', 'RAG', 'agentic', 'AI.agent', 'embedding', 'GPT', 'langchain', 'vector'], job_description_pattern_not: ['security.clearance', 'TS/SCI', 'polygraph'], job_description_pattern_is_case_insensitive: true, employment_statuses_or: ['full_time'], job_id_not: $('Build Source Exclusions').first().json.theirstack_job_id_not || [], include_total_results: false, order_by: [{ desc: true, field: 'date_posted' }, { desc: true, field: 'discovered_at' }] }) }}`,
+      jsonBody: `={{ JSON.stringify({ page: 0, limit: Number($('Config').first().json.theirstack_limit || 10), posted_at_max_age_days: 1, job_country_code_or: ['US'], job_seniority_or: ['junior', 'mid_level'], company_type: 'direct_employer', max_employee_count: 500, funding_stage_or: ['pre_seed', 'seed', 'series_a', 'series_b', 'early_vc', 'angel', 'venture_round_not_specified'], job_title_pattern_or: ['AI.engineer', 'ML.engineer', 'LLM.engineer', 'machine.learning.engineer', 'applied.AI', 'agent.engineer', 'gen.AI', 'AI.platform', 'data.engineer', 'software.engineer', 'backend.engineer'], job_title_pattern_not: ['staff', 'principal', 'director', 'VP', 'head.of', 'lead', 'distinguished', 'intern', 'co.op'], job_description_pattern_or: ['LLM', 'RAG', 'agentic', 'AI.agent', 'embedding', 'GPT', 'langchain', 'vector', 'FastAPI', 'Python', 'TypeScript', 'microservice', 'distributed.systems', 'ETL', 'data.pipeline', 'dbt', 'Airflow', 'Postgres', 'Azure'], job_description_pattern_not: ['security.clearance', 'TS/SCI', 'polygraph', 'Public.Trust', 'US.citizens.only', 'must.be.a.US.citizen', 'citizenship.required', 'no.visa.sponsorship', 'without.sponsorship', 'without.current.or.future.sponsorship'], job_description_pattern_is_case_insensitive: true, employment_statuses_or: ['full_time'], url_domain_not: ${JSON.stringify(BLOCKED_URL_DOMAIN_NOT)}, job_id_not: $('Build Source Exclusions').first().json.theirstack_job_id_not || [], include_total_results: false, order_by: [{ desc: true, field: 'date_posted' }, { desc: true, field: 'discovered_at' }] }) }}`,
       options: { timeout: 30000 },
     }, { onError: 'continueRegularOutput', alwaysOutputData: true }),
-    codeAll('Explode TheirStack', [1520, 700], SRC.explodeTheirstack, { alwaysOutputData: true }),
-    code('Normalize TheirStack Jobs', [1740, 700], SRC.normTheirstack, 'runOnceForEachItem', { alwaysOutputData: true }),
+    codeAll('Explode TheirStack', [COL(7), Y.BOT], SRC.explodeTheirstack, { alwaysOutputData: true }),
+    code('Normalize TheirStack Jobs', [COL(8), Y.BOT], SRC.normTheirstack, 'runOnceForEachItem', { alwaysOutputData: true }),
 
-    N('Merge JSearch Apify', 'n8n-nodes-base.merge', 3, [2060, 280], { mode: 'append', options: {} }),
-    N('Merge All Job Sources', 'n8n-nodes-base.merge', 3, [2240, 420], { mode: 'append', options: {} }),
-    codeAll('Filter Stale Jobs', [2420, 420], SRC.filterStale, { alwaysOutputData: true }),
-    codeAll('Dedupe Incoming Jobs', [2600, 420], SRC.dedupeIncoming, { alwaysOutputData: true }),
+    N('Merge JSearch Fantastic', 'n8n-nodes-base.merge', 3, [COL(10), Y.IF_TOP], { mode: 'append', numberInputs: 2, options: {} }),
+    N('Merge All Job Sources', 'n8n-nodes-base.merge', 3, [COL(11), Y.MAIN], { mode: 'append', numberInputs: 3, options: {} }),
+    // Three streams into Merge All: 0 = JSearch + Fantastic.jobs (via Merge
+    // JSearch Fantastic), 1 = TheirStack, 2 = stale FETCHED retries from the
+    // Source Job Index. Append preserves order so fresh items beat stale
+    // duplicates when Filter & Dedupe keeps first occurrence.
+    // Stale-FETCHED retry branch — proactively replays jobs whose
+    // scoring loop crashed in a prior run, instead of hoping the source
+    // APIs return them again (they usually don't, ≤1 day freshness).
+    // Reads the same Airtable List snapshot as Build Source Exclusions,
+    // deserializes payload_json from each FETCHED row, stamps a
+    // _retry_from_index flag, and merges into Merge All Job Sources as
+    // input 2. See code-nodes/pull-stale-fetched.js for full reasoning.
+    codeAll('Pull Stale FETCHED', [COL(10), Y.STALE], SRC.pullStaleFetched, { alwaysOutputData: true }),
+    // One node, one iteration, three drops: stale (>24h), excluded (in
+    // index snapshot), duplicate (within current batch by `${source}::${source_job_id}`).
+    // Replaces the previous Filter Stale + Apply Source Exclusions + Dedupe
+    // Incoming chain. Stats stamped on the first surviving item as
+    // `_filter_stats` for n8n run-inspector visibility.
+    codeAll('Filter & Dedupe Incoming', [COL(12), Y.MAIN], SRC.filterIncoming, { alwaysOutputData: true }),
 
-    codeAll('Explode JSearch', [860, 140], SRC.explode),
-    codeAll('Normalize Jobs', [1240, 140], SRC.normalize),
-    codeAll('Seed Airtable Prefetch', [2780, 420], 'return [{ json: { prefetch: true } }];'),
-    // Node-level alwaysOutputData: 0 Airtable rows → 0 items → downstream never runs, yet run "succeeds".
-    AT(
-      'Airtable List Existing',
-      [2960, 420],
+    // Index All Fetched Jobs — terminal node for 01. Writes FETCHED rows with
+    // payload_json; Workflow 02 reads them independently. Custom code PATCHes
+    // Airtable in chunks with retry/backoff.
+    codeAll('Index All Fetched Jobs', [COL(13), Y.MAIN], SRC.indexFetched, { alwaysOutputData: true }),
+
+    codeAll('Explode JSearch', [COL(4), Y.TOP], SRC.explode),
+    codeAll('Normalize Jobs', [COL(5), Y.TOP], SRC.normalize),
+  ];
+
+  const X = {
+    'Manual Test':               { main: [[ conn('Fetch Config') ]] },
+    'Twice daily ET':            { main: [[ conn('Fetch Config') ]] },
+    'Fetch Config':              { main: [[ conn('Config') ]] },
+    'Config':                    { main: [[ conn('JSearch API'), conn('Seed Source Exclusions Prefetch') ]] },
+    'Seed Source Exclusions Prefetch': { main: [[ conn('Airtable List Source Job Index') ]] },
+    // Index snapshot fans out to TWO consumers (single Airtable read,
+    // two uses): Build Source Exclusions extracts PROCESSED ids for the
+    // exclusion lists, Pull Stale FETCHED extracts FETCHED rows whose
+    // payload_json gets replayed as a 4th source into Merge All.
+    'Airtable List Source Job Index': { main: [[ conn('Build Source Exclusions'), conn('Pull Stale FETCHED') ]] },
+    'Build Source Exclusions': { main: [[ conn('TheirStack Jobs API'), conn('Fantastic Jobs API') ]] },
+    'Pull Stale FETCHED': { main: [[ connIn('Merge All Job Sources', 2) ]] },
+    'JSearch API':               { main: [[ conn('Explode JSearch') ]] },
+    'Explode JSearch':           { main: [[ conn('Normalize Jobs') ]] },
+    'Normalize Jobs':            { main: [[ connIn('Merge JSearch Fantastic', 0) ]] },
+    'Fantastic Jobs API':        { main: [[ conn('IF Fantastic Dataset') ]] },
+    'IF Fantastic Dataset':      { main: [[ conn('Fantastic Fetch Dataset') ], [ conn('Fantastic Skip No Dataset') ]] },
+    'Fantastic Fetch Dataset':   { main: [[ conn('Explode Fantastic Dataset') ]] },
+    'Fantastic Skip No Dataset': { main: [[ conn('Explode Fantastic Dataset') ]] },
+    'Explode Fantastic Dataset': { main: [[ conn('Filter Fantastic Prefilter') ]] },
+    'Filter Fantastic Prefilter': { main: [[ conn('Normalize Fantastic Jobs') ]] },
+    'Normalize Fantastic Jobs':  { main: [[ connIn('Merge JSearch Fantastic', 1) ]] },
+    'Merge JSearch Fantastic': { main: [[ connIn('Merge All Job Sources', 0) ]] },
+    'TheirStack Jobs API':       { main: [[ conn('Explode TheirStack') ]] },
+    'Explode TheirStack':        { main: [[ conn('Normalize TheirStack Jobs') ]] },
+    'Normalize TheirStack Jobs': { main: [[ connIn('Merge All Job Sources', 1) ]] },
+    'Merge All Job Sources':     { main: [[ conn('Filter & Dedupe Incoming') ]] },
+    'Filter & Dedupe Incoming':  { main: [[ conn('Index All Fetched Jobs') ]] },
+  };
+
+  return wrap('Job Pipeline 01 — Job Sourcing', nodes, X);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WORKFLOW 02 — Score & Package (Split Jobs → Telegram)
+// ═══════════════════════════════════════════════════════════════════════
+// Independent of 01: Fetch Config → 00, list FETCHED rows from Source Job
+// Index, deserialize payload_json, then existing scoring loop.
+// If no FETCHED rows exist, Airtable returns 0 items → Deserialize and
+// Split Jobs never run (no Azure). Never enable alwaysOutputData on the
+// Airtable list node.
+// STATUS STRINGS MUST match code-nodes/_statuses.js.
+// ═══════════════════════════════════════════════════════════════════════
+function buildScoring() {
+  const SC = (k) => (k - 12) * 220;
+  const Y = {
+    TOP: 100, CFG: 200, IF_TOP: 240, TRIG: 300,
+    MAIN: 380, FANT_TOP: 460, IF_BOT: 520, FANT_BOT: 580, BOT: 660, STALE: 800, WRAP: 880,
+  };
+
+  const cfg = configLoader([220, Y.CFG]);
+
+  const nodes = [
+    N('Manual Test', 'n8n-nodes-base.manualTrigger', 1, [0, Y.TRIG], {}),
+    N('Every 30 minutes', 'n8n-nodes-base.scheduleTrigger', 1.2, [0, Y.TOP], {
+      rule: { interval: [{ field: 'minutes', minutesInterval: 30 }] },
+    }, { disabled: true, notes: 'Enable when ready for automatic scoring runs.', notesInFlow: true }),
+    ...cfg.nodes,
+    ATIdx(
+      'Airtable List FETCHED',
+      [660, Y.CFG],
       'search',
-      { returnAll: true, options: {} },
-      { alwaysOutputData: true },
+      {
+        returnAll: true,
+        filterByFormula: '={outcome}="FETCHED"',
+        options: {},
+      },
     ),
-    codeAll('Prefetch Dedup Snapshot', [3140, 420], SRC.prefetchDedup),
-    N('Split Jobs', 'n8n-nodes-base.splitInBatches', 3, [3320, 540], { batchSize: 1, options: {} }),
+    codeAll('Deserialize FETCHED Payloads', [770, Y.CFG], SRC.deserializeFetched),
+    // Main-table prefetch dedup is gone: every job that ever became a packet
+    // was first fetched, and every fetched job is in the Source Job Index.
+    // So if `Filter & Dedupe Incoming` already dropped a job against the
+    // index, it can't possibly be in the main table either. The Airtable
+    // Create Packet upsert (matched on source + source_job_id) handles the
+    // residual race-condition case where two concurrent runs reach Create at once.
+    N('Split Jobs', 'n8n-nodes-base.splitInBatches', 3, [SC(15), Y.MAIN], { batchSize: 1, options: {} }),
 
-    N('IF New Job', 'n8n-nodes-base.if', 2.2, [3560, 540], {
-      conditions: { options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
-        conditions: [{ id: 'c1', leftValue: '={{ $json.is_duplicate }}', rightValue: false,
-          operator: { type: 'boolean', operation: 'equals', singleValue: true } }],
-        combinator: 'and' },
-    }),
-
-    // ── duplicate branch (skip logic is inside the code node; empty output = skip) ──
-    codeAll('Safe Update Logic', [3560, 780], withS(SRC.safeUpdate)),
-    AT('Update Dup Record', [3800, 780], 'update', {
-      columns: { mappingMode: 'defineBelow', value: {
-        id: '={{ $json.record_id }}',
-        notes: '={{ $json.notes }}',
-      }, matchingColumns: ['id'], schema: [] },
-      options: {},
-    }),
-
-    // ── scoring branch ──
-    code('Prepare Azure Score Body', [3800, 480], SRC.prepScore),
-    N('Azure Fit Score', 'n8n-nodes-base.httpRequest', 4.2, [4020, 480], {
+    code('Prepare Azure Score Body', [SC(16), Y.MAIN], SRC.prepScore),
+    N('Azure Fit Score', 'n8n-nodes-base.httpRequest', 4.2, [SC(17), Y.MAIN], {
       method: 'POST', url: azureUrl,
       sendHeaders: true,
       headerParameters: { parameters: [
@@ -332,10 +504,15 @@ function buildA() {
       jsonBody: '={{ JSON.stringify($json.azure_body) }}',
       options: { timeout: 120000 },
     }),
-    code('Parse Fit Score', [4240, 480], SRC.parseScore),
-    code('Score Bucket', [4460, 480], SRC.scoreBucket),
+    code('Parse Fit Score', [SC(18), Y.MAIN], SRC.parseScore),
+    code('Score Bucket', [SC(19), Y.MAIN], SRC.scoreBucket),
 
-    N('Switch Bucket', 'n8n-nodes-base.switch', 3.2, [4680, 480], {
+    code('Mark As Processed', [SC(20), Y.MAIN], SRC.markIndexProcessed, 'runOnceForEachItem', {
+      alwaysOutputData: true,
+    }),
+    codeAll('Restore Bucket Payload', [SC(21), Y.MAIN], SRC.restoreBucketPayload, { alwaysOutputData: true }),
+
+    N('Switch Bucket', 'n8n-nodes-base.switch', 3.2, [SC(22), Y.MAIN], {
       rules: { values: [
         { conditions: { options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
             conditions: [{ id: 'r1', leftValue: '={{ $json.bucket }}', rightValue: 'packet',
@@ -345,9 +522,8 @@ function buildA() {
       options: { fallbackOutput: 'extra' },
     }),
 
-    // ── packet branch only (low scores: fallback → Split Jobs, no Airtable) ──
-    code('Prepare Azure Tailor Body', [4920, 220], SRC.prepTailor),
-    N('Azure Tailor Resume', 'n8n-nodes-base.httpRequest', 4.2, [5140, 220], {
+    code('Prepare Azure Tailor Body', [SC(23), Y.MAIN], SRC.prepTailor),
+    N('Azure Tailor Resume', 'n8n-nodes-base.httpRequest', 4.2, [SC(24), Y.MAIN], {
       method: 'POST', url: azureUrl,
       sendHeaders: true,
       headerParameters: { parameters: [
@@ -358,19 +534,36 @@ function buildA() {
       jsonBody: '={{ JSON.stringify($json.azure_body) }}',
       options: { timeout: 180000 },
     }),
-    code('Parse Tailor Response', [5360, 220], SRC.parseTailor),
-    code('Build Packet Text', [5580, 220], SRC.buildPacket),
+    code('Parse Tailor Response', [SC(25), Y.MAIN], SRC.parseTailor),
 
-    codeAll('Prep Binary Metadata', [5800, 80], SRC.prepMetaBin),
-    ABU('Upload Metadata', [6020, 80], '={{ $json.folder_name + \'/application_metadata.json\' }}'),
-    codeAll('Prep Binary JD', [5800, 320], SRC.prepJdBin),
-    ABU('Upload JD', [6020, 320], '={{ $json.folder_name + \'/original_jd.md\' }}'),
-    codeAll('Convert Resume PDF', [6240, 320], SRC.convertResumePdf),
-    ABU('Upload Resume', [6460, 320], '={{ $json.folder_name + \'/\' + $json.resume_pdf_filename }}'),
+    code('Prepare Azure Cover Letter Body', [SC(26), Y.MAIN], SRC.prepCoverLetter),
+    N('Azure Cover Letter', 'n8n-nodes-base.httpRequest', 4.2, [SC(27), Y.MAIN], {
+      method: 'POST', url: azureUrl,
+      sendHeaders: true,
+      headerParameters: { parameters: [
+        { name: 'api-key', value: C('azure_openai_api_key') },
+        { name: 'Content-Type', value: 'application/json' },
+      ]},
+      sendBody: true, specifyBody: 'json',
+      jsonBody: '={{ JSON.stringify($json.azure_body) }}',
+      options: { timeout: 120000 },
+    }),
+    code('Parse Cover Letter Response', [SC(28), Y.MAIN], SRC.parseCoverLetter),
 
-    code('Assemble Airtable Row', [6680, 320], SRC.assembleRow),
+    code('Build Packet Text', [SC(29), Y.MAIN], SRC.buildPacket),
 
-    AT('Airtable Create Packet', [6900, 320], 'create', {
+    codeAll('Prep Binary Metadata', [SC(29), Y.WRAP], SRC.prepMetaBin),
+    ABU('Upload Metadata', [SC(28), Y.WRAP], '={{ $json.folder_name + \'/application_metadata.json\' }}'),
+    codeAll('Prep Binary JD', [SC(27), Y.WRAP], SRC.prepJdBin),
+    ABU('Upload JD', [SC(26), Y.WRAP], '={{ $json.folder_name + \'/original_jd.md\' }}'),
+    codeAll('Convert Resume PDF', [SC(25), Y.WRAP], SRC.convertResumePdf),
+    ABU('Upload Resume', [SC(24), Y.WRAP], '={{ $json.folder_name + \'/\' + $json.resume_pdf_filename }}'),
+    codeAll('Convert Cover Letter PDF', [SC(23), Y.WRAP], SRC.convertCoverLetterPdf),
+    ABU('Upload Cover Letter', [SC(22), Y.WRAP], '={{ $json.folder_name + \'/\' + $json.cover_letter_pdf_filename }}'),
+
+    code('Assemble Airtable Row', [SC(21), Y.WRAP], SRC.assembleRow),
+
+    AT('Airtable Create Packet', [SC(20), Y.WRAP], 'upsert', {
       columns: { mappingMode: 'defineBelow', value: {
         application_id: '={{ $json.application_id }}',
         source_job_id: '={{ $json.source_job_id }}',
@@ -380,17 +573,17 @@ function buildA() {
         source: '={{ $json.source }}', date_found: '={{ $json.date_found }}',
         status: 'AWAITING_APPROVAL', fit_score: '={{ $json.fit_score }}',
         resume_link: '={{ $json.resume_link }}', jd_snapshot_link: '={{ $json.jd_snapshot_link }}',
-        cover_letter_link: '', submission_mode: 'MANUAL_REQUIRED',
+        cover_letter_link: '={{ $json.cover_letter_link }}', submission_mode: 'MANUAL_REQUIRED',
         notes: '={{ $json.automation_note }}', next_action: 'Review Telegram approval',
         salary: '={{ $json.salary }}', remote_status: '={{ $json.remote_status }}',
         visa_notes: '={{ $json.visa_notes }}',
         drive_folder_id: '={{ $json.drive_folder_id }}',
-      }, matchingColumns: [], schema: [] }, options: {},
+      }, matchingColumns: ['source_job_id', 'source'], schema: [] }, options: {},
     }),
 
-    code('Build Telegram Approval', [7120, 320], SRC.tgPayload),
+    code('Build Telegram Approval', [SC(19), Y.WRAP], SRC.tgPayload),
 
-    N('Telegram Send Preview', 'n8n-nodes-base.httpRequest', 4.2, [7340, 320], {
+    N('Telegram Send Preview', 'n8n-nodes-base.httpRequest', 4.2, [SC(18), Y.WRAP], {
       method: 'POST', url: tgUrl('sendMessage'),
       sendBody: true, specifyBody: 'json',
       jsonBody: '={{ JSON.stringify($json.telegram_http_body) }}',
@@ -400,59 +593,41 @@ function buildA() {
 
   const X = {
     'Manual Test':               { main: [[ conn('Fetch Config') ]] },
-    'Twice daily ET':            { main: [[ conn('Fetch Config') ]] },
+    'Every 30 minutes':          { main: [[ conn('Fetch Config') ]] },
     'Fetch Config':              { main: [[ conn('Config') ]] },
-    'Config':                    { main: [[ conn('JSearch API'), conn('Apify Job Pulse'), conn('Seed Source Exclusions Prefetch') ]] },
-    'Seed Source Exclusions Prefetch': { main: [[ conn('Airtable List Existing (Source Exclusions)') ]] },
-    'Airtable List Existing (Source Exclusions)': { main: [[ conn('Build Source Exclusions') ]] },
-    'Build Source Exclusions': { main: [[ conn('TheirStack Jobs API') ]] },
-    'JSearch API':               { main: [[ conn('Explode JSearch') ]] },
-    'Explode JSearch':           { main: [[ conn('Normalize Jobs') ]] },
-    'Normalize Jobs':            { main: [[ connIn('Merge JSearch Apify', 0) ]] },
-    'Apify Job Pulse':           { main: [[ conn('IF Apify Dataset') ]] },
-    'IF Apify Dataset':          { main: [[ conn('Apify Fetch Dataset') ], [ conn('Apify Skip No Dataset') ]] },
-    'Apify Fetch Dataset':       { main: [[ conn('Explode Apify Dataset') ]] },
-    'Apify Skip No Dataset':     { main: [[ conn('Explode Apify Dataset') ]] },
-    'Explode Apify Dataset':     { main: [[ conn('Normalize Apify Jobs') ]] },
-    'Normalize Apify Jobs':      { main: [[ conn('Scrape Apify JDs') ]] },
-    'Scrape Apify JDs':          { main: [[ conn('Merge Scraped JDs') ]] },
-    'Merge Scraped JDs':         { main: [[ connIn('Merge JSearch Apify', 1) ]] },
-    'Merge JSearch Apify':       { main: [[ connIn('Merge All Job Sources', 0) ]] },
-    'TheirStack Jobs API':       { main: [[ conn('Explode TheirStack') ]] },
-    'Explode TheirStack':        { main: [[ conn('Normalize TheirStack Jobs') ]] },
-    'Normalize TheirStack Jobs': { main: [[ connIn('Merge All Job Sources', 1) ]] },
-    'Merge All Job Sources':     { main: [[ conn('Filter Stale Jobs') ]] },
-    'Filter Stale Jobs':         { main: [[ conn('Dedupe Incoming Jobs') ]] },
-    'Dedupe Incoming Jobs':      { main: [[ conn('Seed Airtable Prefetch') ]] },
-    'Seed Airtable Prefetch':    { main: [[ conn('Airtable List Existing') ]] },
-    'Airtable List Existing':    { main: [[ conn('Prefetch Dedup Snapshot') ]] },
-    'Prefetch Dedup Snapshot':   { main: [[ conn('Split Jobs') ]] },
-    'Split Jobs':                { main: [[], [conn('IF New Job')]] },
-    'IF New Job':                { main: [[ conn('Prepare Azure Score Body') ], [ conn('Safe Update Logic') ]] },
-    'Safe Update Logic':         { main: [[ conn('Update Dup Record') ]] },
-    'Update Dup Record':         { main: [[ conn('Split Jobs') ]] },
+    'Config':                    { main: [[ conn('Airtable List FETCHED') ]] },
+    'Airtable List FETCHED':     { main: [[ conn('Deserialize FETCHED Payloads') ]] },
+    'Deserialize FETCHED Payloads': { main: [[ conn('Split Jobs') ]] },
+    'Split Jobs':                { main: [[], [conn('Prepare Azure Score Body')]] },
     'Prepare Azure Score Body':  { main: [[ conn('Azure Fit Score') ]] },
     'Azure Fit Score':           { main: [[ conn('Parse Fit Score') ]] },
     'Parse Fit Score':           { main: [[ conn('Score Bucket') ]] },
-    'Score Bucket':              { main: [[ conn('Switch Bucket') ]] },
+    'Score Bucket':              { main: [[ conn('Mark As Processed') ]] },
+    'Mark As Processed':         { main: [[ conn('Restore Bucket Payload') ]] },
+    'Restore Bucket Payload':    { main: [[ conn('Switch Bucket') ]] },
     'Switch Bucket':             { main: [[ conn('Prepare Azure Tailor Body') ], [ conn('Split Jobs') ]] },
     'Prepare Azure Tailor Body': { main: [[ conn('Azure Tailor Resume') ]] },
     'Azure Tailor Resume':       { main: [[ conn('Parse Tailor Response') ]] },
-    'Parse Tailor Response':     { main: [[ conn('Build Packet Text') ]] },
+    'Parse Tailor Response':     { main: [[ conn('Prepare Azure Cover Letter Body') ]] },
+    'Prepare Azure Cover Letter Body': { main: [[ conn('Azure Cover Letter') ]] },
+    'Azure Cover Letter':        { main: [[ conn('Parse Cover Letter Response') ]] },
+    'Parse Cover Letter Response': { main: [[ conn('Build Packet Text') ]] },
     'Build Packet Text':         { main: [[ conn('Prep Binary Metadata') ]] },
     'Prep Binary Metadata':      { main: [[ conn('Upload Metadata') ]] },
     'Upload Metadata':           { main: [[ conn('Prep Binary JD') ]] },
     'Prep Binary JD':            { main: [[ conn('Upload JD') ]] },
     'Upload JD':                 { main: [[ conn('Convert Resume PDF') ]] },
     'Convert Resume PDF':        { main: [[ conn('Upload Resume') ]] },
-    'Upload Resume':             { main: [[ conn('Assemble Airtable Row') ]] },
+    'Upload Resume':             { main: [[ conn('Convert Cover Letter PDF') ]] },
+    'Convert Cover Letter PDF':  { main: [[ conn('Upload Cover Letter') ]] },
+    'Upload Cover Letter':       { main: [[ conn('Assemble Airtable Row') ]] },
     'Assemble Airtable Row':     { main: [[ conn('Airtable Create Packet') ]] },
     'Airtable Create Packet':    { main: [[ conn('Build Telegram Approval') ]] },
     'Build Telegram Approval':   { main: [[ conn('Telegram Send Preview') ]] },
     'Telegram Send Preview':     { main: [[ conn('Split Jobs') ]] },
   };
 
-  return wrap('Job Pipeline A — Source Score Package', nodes, X);
+  return wrap('Job Pipeline 02 — Score & Package', nodes, X);
 }
 
 
@@ -713,13 +888,29 @@ function buildD() {
 // WORKFLOW E — Manual URL -> Score -> Tailor -> Packet
 // ═══════════════════════════════════════════════════════════════════════
 function buildE() {
-  const cfg = configLoader([220, 200]);
+  // ── Layout grid (same convention as Workflow A) ───────────────────────
+  // Workflow E mirrors A's packet/upload tail without the splitInBatches
+  // loop, so the chain is shorter (~30 nodes) but still long enough that
+  // a flat horizontal layout becomes ~6500 px wide. We snap to the same
+  // 220 px grid, give the IF Has JD Text branches their own short lanes,
+  // and wrap the upload + Telegram tail back under the main flow at
+  // Y.WRAP, going right-to-left. Total canvas ends up ~4400 px wide.
+  //
+  // Vertical lanes:
+  //   Y.PASTE   80  Manual JD paste branch (top output of IF Has JD Text)
+  //   Y.MAIN   220  Trigger → Config → URL Input → IF → Score → Tailor → Cover → BPT
+  //   Y.URL    360  Scrape Job URL + Normalize Manual URL Job (bottom branch of IF)
+  //   Y.WRAP   620  Wrapped upload + Telegram tail (right-to-left)
+  const COL = (i) => i * 220;
+  const Y = { PASTE: 80, MAIN: 220, URL: 360, WRAP: 620 };
+
+  const cfg = configLoader([COL(1), Y.MAIN]);
 
   const nodes = [
-    N('Manual Trigger', 'n8n-nodes-base.manualTrigger', 1, [0, 200], {}),
+    N('Manual Trigger', 'n8n-nodes-base.manualTrigger', 1, [COL(0), Y.MAIN], {}),
     ...cfg.nodes,
 
-    N('Manual URL Input', 'n8n-nodes-base.set', 3.4, [660, 200], {
+    N('Manual URL Input', 'n8n-nodes-base.set', 3.4, [COL(3), Y.MAIN], {
       mode: 'manual',
       duplicateItem: false,
       assignments: { assignments: [
@@ -732,16 +923,16 @@ function buildE() {
       options: {},
     }, { notesInFlow: true, notes: 'Two modes: (1) paste a URL into job_url and leave job_description empty → workflow scrapes the page; (2) paste raw JD text into job_description (optionally also company/job_title/job_url) → scraping is skipped.' }),
 
-    N('IF Has JD Text', 'n8n-nodes-base.if', 2.2, [840, 200], {
+    N('IF Has JD Text', 'n8n-nodes-base.if', 2.2, [COL(4), Y.MAIN], {
       conditions: { options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
         conditions: [{ id: 'jd', leftValue: '={{ $json.job_description }}', rightValue: '',
           operator: { type: 'string', operation: 'notEmpty' } }],
         combinator: 'and' },
     }),
 
-    codeAll('Normalize Manual JD Paste', [1060, 60], SRC.normManualPaste),
+    codeAll('Normalize Manual JD Paste', [COL(5), Y.PASTE], SRC.normManualPaste),
 
-    N('Scrape Job URL', 'n8n-nodes-base.httpRequest', 4.2, [1060, 340], {
+    N('Scrape Job URL', 'n8n-nodes-base.httpRequest', 4.2, [COL(5), Y.URL], {
       method: 'GET',
       url: '={{ $json.job_url }}',
       sendHeaders: true,
@@ -752,10 +943,10 @@ function buildE() {
       responseFormat: 'text',
       options: { timeout: 20000, redirect: { redirect: { maxRedirects: 5 } } },
     }, { onError: 'continueRegularOutput' }),
-    codeAll('Normalize Manual URL Job', [1280, 340], SRC.normManualUrl),
+    codeAll('Normalize Manual URL Job', [COL(6), Y.URL], SRC.normManualUrl),
 
-    code('Prepare Azure Score Body', [1360, 200], SRC.prepScore),
-    N('Azure Fit Score', 'n8n-nodes-base.httpRequest', 4.2, [1580, 200], {
+    code('Prepare Azure Score Body', [COL(7), Y.MAIN], SRC.prepScore),
+    N('Azure Fit Score', 'n8n-nodes-base.httpRequest', 4.2, [COL(8), Y.MAIN], {
       method: 'POST', url: azureUrl,
       sendHeaders: true,
       headerParameters: { parameters: [
@@ -766,9 +957,9 @@ function buildE() {
       jsonBody: '={{ JSON.stringify($json.azure_body) }}',
       options: { timeout: 120000 },
     }),
-    code('Parse Fit Score', [1800, 200], SRC.parseScore),
-    code('Score Bucket', [2020, 200], SRC.scoreBucket),
-    N('Switch Bucket', 'n8n-nodes-base.switch', 3.2, [2240, 200], {
+    code('Parse Fit Score', [COL(9), Y.MAIN], SRC.parseScore),
+    code('Score Bucket', [COL(10), Y.MAIN], SRC.scoreBucket),
+    N('Switch Bucket', 'n8n-nodes-base.switch', 3.2, [COL(11), Y.MAIN], {
       rules: { values: [
         { conditions: { options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
             conditions: [{ id: 'r1', leftValue: '={{ $json.bucket }}', rightValue: 'packet',
@@ -777,8 +968,8 @@ function buildE() {
       ]},
       options: { fallbackOutput: 'extra' },
     }),
-    code('Prepare Azure Tailor Body', [2460, 140], SRC.prepTailor),
-    N('Azure Tailor Resume', 'n8n-nodes-base.httpRequest', 4.2, [2680, 140], {
+    code('Prepare Azure Tailor Body', [COL(12), Y.MAIN], SRC.prepTailor),
+    N('Azure Tailor Resume', 'n8n-nodes-base.httpRequest', 4.2, [COL(13), Y.MAIN], {
       method: 'POST', url: azureUrl,
       sendHeaders: true,
       headerParameters: { parameters: [
@@ -789,16 +980,43 @@ function buildE() {
       jsonBody: '={{ JSON.stringify($json.azure_body) }}',
       options: { timeout: 180000 },
     }),
-    code('Parse Tailor Response', [2900, 140], SRC.parseTailor),
-    code('Build Packet Text', [3120, 140], SRC.buildPacket),
-    codeAll('Prep Binary Metadata', [3340, 40], SRC.prepMetaBin),
-    ABU('Upload Metadata', [3560, 40], '={{ $json.folder_name + \'/application_metadata.json\' }}'),
-    codeAll('Prep Binary JD', [3340, 240], SRC.prepJdBin),
-    ABU('Upload JD', [3560, 240], '={{ $json.folder_name + \'/original_jd.md\' }}'),
-    codeAll('Convert Resume PDF', [3780, 240], SRC.convertResumePdf),
-    ABU('Upload Resume', [4000, 240], '={{ $json.folder_name + \'/\' + $json.resume_pdf_filename }}'),
-    code('Assemble Airtable Row', [4220, 240], SRC.assembleRow),
-    AT('Airtable Create Packet', [4440, 240], 'create', {
+    code('Parse Tailor Response', [COL(14), Y.MAIN], SRC.parseTailor),
+
+    code('Prepare Azure Cover Letter Body', [COL(15), Y.MAIN], SRC.prepCoverLetter),
+    N('Azure Cover Letter', 'n8n-nodes-base.httpRequest', 4.2, [COL(16), Y.MAIN], {
+      method: 'POST', url: azureUrl,
+      sendHeaders: true,
+      headerParameters: { parameters: [
+        { name: 'api-key', value: C('azure_openai_api_key') },
+        { name: 'Content-Type', value: 'application/json' },
+      ]},
+      sendBody: true, specifyBody: 'json',
+      jsonBody: '={{ JSON.stringify($json.azure_body) }}',
+      options: { timeout: 120000 },
+    }),
+    code('Parse Cover Letter Response', [COL(17), Y.MAIN], SRC.parseCoverLetter),
+
+    code('Build Packet Text', [COL(18), Y.MAIN], SRC.buildPacket),
+
+    // ── Wrap row: upload + Telegram tail runs RIGHT-TO-LEFT under the
+    // main flow at Y.WRAP. Drops straight DOWN from Build Packet Text
+    // and walks back left to Telegram Send Preview. There's no loop in
+    // this workflow so the chain ends at TSP — the wrap is purely to
+    // keep the canvas compact.
+    codeAll('Prep Binary Metadata', [COL(18), Y.WRAP], SRC.prepMetaBin),
+    ABU('Upload Metadata', [COL(17), Y.WRAP], '={{ $json.folder_name + \'/application_metadata.json\' }}'),
+    codeAll('Prep Binary JD', [COL(16), Y.WRAP], SRC.prepJdBin),
+    ABU('Upload JD', [COL(15), Y.WRAP], '={{ $json.folder_name + \'/original_jd.md\' }}'),
+    codeAll('Convert Resume PDF', [COL(14), Y.WRAP], SRC.convertResumePdf),
+    ABU('Upload Resume', [COL(13), Y.WRAP], '={{ $json.folder_name + \'/\' + $json.resume_pdf_filename }}'),
+    codeAll('Convert Cover Letter PDF', [COL(12), Y.WRAP], SRC.convertCoverLetterPdf),
+    ABU('Upload Cover Letter', [COL(11), Y.WRAP], '={{ $json.folder_name + \'/\' + $json.cover_letter_pdf_filename }}'),
+    code('Assemble Airtable Row', [COL(10), Y.WRAP], SRC.assembleRow),
+    // Upsert (not create) to close the race window: if the same
+    // `${source}::${source_job_id}` somehow reaches this node twice
+    // (concurrent run, manual retry, etc.), the second write becomes an
+    // UPDATE on the existing row instead of a duplicate.
+    AT('Airtable Create Packet', [COL(9), Y.WRAP], 'upsert', {
       columns: { mappingMode: 'defineBelow', value: {
         application_id: '={{ $json.application_id }}',
         source_job_id: '={{ $json.source_job_id }}',
@@ -813,7 +1031,7 @@ function buildE() {
         fit_score: '={{ $json.fit_score }}',
         resume_link: '={{ $json.resume_link }}',
         jd_snapshot_link: '={{ $json.jd_snapshot_link }}',
-        cover_letter_link: '',
+        cover_letter_link: '={{ $json.cover_letter_link }}',
         submission_mode: 'MANUAL_REQUIRED',
         notes: '={{ $json.automation_note }}',
         next_action: 'Review Telegram approval',
@@ -821,10 +1039,10 @@ function buildE() {
         remote_status: '={{ $json.remote_status }}',
         visa_notes: '={{ $json.visa_notes }}',
         drive_folder_id: '={{ $json.drive_folder_id }}',
-      }, matchingColumns: [], schema: [] }, options: {},
+      }, matchingColumns: ['source_job_id', 'source'], schema: [] }, options: {},
     }),
-    code('Build Telegram Approval', [4660, 240], SRC.tgPayload),
-    N('Telegram Send Preview', 'n8n-nodes-base.httpRequest', 4.2, [4880, 240], {
+    code('Build Telegram Approval', [COL(8), Y.WRAP], SRC.tgPayload),
+    N('Telegram Send Preview', 'n8n-nodes-base.httpRequest', 4.2, [COL(7), Y.WRAP], {
       method: 'POST', url: tgUrl('sendMessage'),
       sendBody: true, specifyBody: 'json',
       jsonBody: '={{ JSON.stringify($json.telegram_http_body) }}',
@@ -848,14 +1066,19 @@ function buildE() {
     'Switch Bucket':            { main: [[ conn('Prepare Azure Tailor Body') ], []] },
     'Prepare Azure Tailor Body': { main: [[ conn('Azure Tailor Resume') ]] },
     'Azure Tailor Resume':      { main: [[ conn('Parse Tailor Response') ]] },
-    'Parse Tailor Response':    { main: [[ conn('Build Packet Text') ]] },
+    'Parse Tailor Response':    { main: [[ conn('Prepare Azure Cover Letter Body') ]] },
+    'Prepare Azure Cover Letter Body': { main: [[ conn('Azure Cover Letter') ]] },
+    'Azure Cover Letter':       { main: [[ conn('Parse Cover Letter Response') ]] },
+    'Parse Cover Letter Response': { main: [[ conn('Build Packet Text') ]] },
     'Build Packet Text':        { main: [[ conn('Prep Binary Metadata') ]] },
     'Prep Binary Metadata':     { main: [[ conn('Upload Metadata') ]] },
     'Upload Metadata':          { main: [[ conn('Prep Binary JD') ]] },
     'Prep Binary JD':           { main: [[ conn('Upload JD') ]] },
     'Upload JD':                { main: [[ conn('Convert Resume PDF') ]] },
     'Convert Resume PDF':       { main: [[ conn('Upload Resume') ]] },
-    'Upload Resume':            { main: [[ conn('Assemble Airtable Row') ]] },
+    'Upload Resume':            { main: [[ conn('Convert Cover Letter PDF') ]] },
+    'Convert Cover Letter PDF': { main: [[ conn('Upload Cover Letter') ]] },
+    'Upload Cover Letter':      { main: [[ conn('Assemble Airtable Row') ]] },
     'Assemble Airtable Row':    { main: [[ conn('Airtable Create Packet') ]] },
     'Airtable Create Packet':   { main: [[ conn('Build Telegram Approval') ]] },
     'Build Telegram Approval':  { main: [[ conn('Telegram Send Preview') ]] },
@@ -871,11 +1094,12 @@ fs.mkdirSync(outDir, { recursive: true });
 
 const wfs = [
   ['00-shared-config.json',        build00()],
-  ['01-source-score-package.json',  buildA()],
-  ['02-telegram-approval.json',     buildB()],
-  ['03-submission-executor.json',   buildC()],
-  ['04-reporting.json',             buildD()],
-  ['05-manual-url-intake.json',     buildE()],
+  ['01-job-sourcing.json',         buildSourcing()],
+  ['02-job-score-package.json',    buildScoring()],
+  ['03-telegram-approval.json',     buildB()],
+  ['04-submission-executor.json',   buildC()],
+  ['05-reporting.json',             buildD()],
+  ['06-manual-url-intake.json',     buildE()],
 ];
 
 for (const [file, wf] of wfs) {
@@ -886,8 +1110,8 @@ for (const [file, wf] of wfs) {
 console.log('\nDone. Import order:');
 console.log('  1) 00-shared-config.json   ← copy its workflow ID');
 console.log('  2) Open Config node in 00, paste your real values');
-console.log('  3) Import 01, 02, 03, 04, 05');
-console.log('  4) In each: open "Fetch Config" node → set workflow ID to 00\'s ID');
-console.log('  5) In 02: also set submission_workflow_id in 00 Config to 03\'s ID');
-console.log('  6) Attach Azure Storage (Shared Key) credential to all Azure Blob nodes in 01 + 03');
+console.log('  3) Import 01, 02, 03, 04, 05, 06');
+console.log('  4) In each imported workflow: open "Fetch Config" → set workflow ID to 00\'s ID');
+console.log('  5) In 00 Config: set scoring_workflow_id to 02\'s ID; submission_workflow_id to 04\'s ID');
+console.log('  6) Attach Azure Storage (Shared Key) credential to all Azure Blob nodes in 02 + 04');
 console.log('  7) Deploy md-to-pdf Azure Function (see azure-functions/md-to-pdf/README.md); set pdf_converter_url in 00 Config');

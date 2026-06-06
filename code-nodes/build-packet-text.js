@@ -48,6 +48,7 @@ const metadata = {
     red_flags: j.red_flags || [],
     visa_notes: j.visa_notes || '',
     ats_keywords: j.ats_keywords_added || [],
+    cover_letter_md: j.cover_letter_md || '',
   },
   fix_count: 0,
   fix_history: [],

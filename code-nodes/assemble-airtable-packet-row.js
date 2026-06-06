@@ -17,7 +17,9 @@ const folder = base.folder_name || '';
 const drive_folder_id = folder;
 
 const resumeFilename = String(cfg.resume_pdf_filename || 'Resume.pdf');
+const clFilename = String(cfg.cover_letter_pdf_filename || 'Cover_Letter.pdf');
 const resume_link = blobPublicUrl(`${folder}/${resumeFilename}`);
+const cover_letter_link = blobPublicUrl(`${folder}/${clFilename}`);
 const jd_snapshot_link = blobPublicUrl(`${folder}/original_jd.md`);
 const metadata_link = blobPublicUrl(`${folder}/application_metadata.json`);
 
@@ -29,6 +31,7 @@ return {
     ...base,
     drive_folder_id,
     resume_link,
+    cover_letter_link,
     jd_snapshot_link,
     metadata_link,
     automation_note: note,

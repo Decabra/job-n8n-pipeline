@@ -4,16 +4,16 @@ const url = String(cfg.pdf_converter_url || '').trim();
 
 if (!url) {
   throw new Error(
-    '[Convert Resume PDF] Set pdf_converter_url in workflow 00 Config: full Azure Function URL (include ?code=... from portal).',
+    '[Convert Cover Letter PDF] Set pdf_converter_url in workflow 00 Config.',
   );
 }
 
-const markdown = String(base.tailored_resume_md || '');
+const markdown = String(base.cover_letter_md || '');
 if (!markdown.trim()) {
-  throw new Error('[Convert Resume PDF] Empty tailored_resume_md from Build Packet Text');
+  throw new Error('[Convert Cover Letter PDF] Empty cover_letter_md from Build Packet Text');
 }
 
-const body = JSON.stringify({ markdown });
+const body = JSON.stringify({ markdown, type: 'cover_letter' });
 
 function decodeErrBody(data) {
   if (data == null) return '';
@@ -55,7 +55,7 @@ try {
     }
   }
   if (status) extra = `HTTP ${status}: ${extra}`;
-  throw new Error(`[Convert Resume PDF] Request failed: ${extra}`);
+  throw new Error(`[Convert Cover Letter PDF] Request failed: ${extra}`);
 }
 
 if (!Buffer.isBuffer(pdfBuf)) {
@@ -65,12 +65,12 @@ if (!Buffer.isBuffer(pdfBuf)) {
 if (pdfBuf.length < 100 || pdfBuf.slice(0, 5).toString('ascii') !== '%PDF-') {
   const preview = pdfBuf.toString('utf8', 0, 400);
   throw new Error(
-    `[Convert Resume PDF] Response is not a PDF (got ${pdfBuf.length} bytes). Preview: ${preview}`,
+    `[Convert Cover Letter PDF] Response is not a PDF (got ${pdfBuf.length} bytes). Preview: ${preview}`,
   );
 }
 
-const resumeFilename = String(cfg.resume_pdf_filename || 'Resume.pdf');
-const binary = await this.helpers.prepareBinaryData(pdfBuf, 'application/pdf', resumeFilename);
+const clFilename = String(cfg.cover_letter_pdf_filename || 'Cover_Letter.pdf');
+const binary = await this.helpers.prepareBinaryData(pdfBuf, 'application/pdf', clFilename);
 const drive_folder_id = base.folder_name;
 
-return [{ json: { ...base, drive_folder_id, resume_pdf_filename: resumeFilename }, binary: { data: binary } }];
+return [{ json: { ...base, drive_folder_id, cover_letter_pdf_filename: clFilename }, binary: { data: binary } }];

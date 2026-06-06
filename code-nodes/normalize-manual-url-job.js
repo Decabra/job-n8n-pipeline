@@ -11,7 +11,7 @@ function fnv1aHex(inputStr) {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
-// ── HTML→text strip (matches Workflow A merge-scraped-jd.js) ──
+// ── HTML→text strip (same approach as JD HTML fetched in Workflow A) ──
 function stripHtml(html) {
   let t = String(html || '');
   t = t.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
@@ -82,6 +82,43 @@ function extractMeta(html) {
   };
 }
 
+// ── __NEXT_DATA__ extraction (Ashby and other Next.js-based ATSes) ──
+// Ashby embeds the full posting in a __NEXT_DATA__ script tag for
+// client-side hydration. A plain stripHtml gives us the page shell only
+// (header/nav/footer) because the actual JD body is rendered by JS at
+// runtime. Walking the parsed JSON for description-shaped string fields
+// gets us the real content. Schema varies by tenant
+// (props.pageProps.posting.descriptionHtml on Ashby, others use body /
+// content / posting.description), so we recursively collect candidates
+// and pick the longest one — which is almost always the full JD body
+// rather than a meta-description blurb.
+function extractNextData(html) {
+  const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    const fieldNames = /^(description|descriptionHtml|descriptionPlain|jobDescription|body|content|contentHtml)$/i;
+    const candidates = [];
+    function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) { for (const v of node) walk(v); return; }
+      for (const [k, v] of Object.entries(node)) {
+        if (typeof v === 'string' && fieldNames.test(k) && v.length > 200) {
+          candidates.push(v);
+        } else if (v && typeof v === 'object') {
+          walk(v);
+        }
+      }
+    }
+    walk(parsed);
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.length - a.length);
+    return stripHtml(candidates[0]);
+  } catch (_) {
+    return null;
+  }
+}
+
 // ── Targeted content region extraction (job-specific containers → <main> → <article>) ──
 function extractMainContent(html) {
   const patterns = [
@@ -101,7 +138,7 @@ function extractMainContent(html) {
   return null;
 }
 
-// ── Error detection (matches Workflow A merge-scraped-jd.js) ──
+// ── Error detection (empty body, bot walls, non-HTML) ──
 const rawUrl = String(input.job_url || '').trim();
 if (!rawUrl) {
   throw new Error('[Manual URL] Missing job_url in "Manual URL Input" node.');
@@ -161,7 +198,15 @@ if (jsonLd) {
   datePosted = String(jsonLd.datePosted || '').slice(0, 10);
 }
 
-// If JSON-LD description is thin, try targeted HTML content extraction
+// If JSON-LD description is thin, try __NEXT_DATA__ (Ashby/Next.js sites)
+if (jobDescription.length < 200) {
+  const nextData = extractNextData(html);
+  if (nextData && nextData.length > jobDescription.length) {
+    jobDescription = nextData;
+  }
+}
+
+// Still thin? Try targeted HTML content extraction (server-rendered sites)
 if (jobDescription.length < 200) {
   const mainContent = extractMainContent(html);
   if (mainContent && mainContent.length > jobDescription.length) {

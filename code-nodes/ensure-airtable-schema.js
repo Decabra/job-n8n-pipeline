@@ -1,13 +1,16 @@
 const cfg = $json && typeof $json === 'object' ? $json : {};
 
-/** Bump when `fieldDefs` changes so cache invalidates after template updates. */
-const SCHEMA_VERSION = 12;
+/** Bump when `mainFieldDefs` or `sourceIndexFieldDefs` change so cache invalidates after template updates. */
+const SCHEMA_VERSION = 15;
 
 const pat = String(cfg.airtable_pat || '');
 const baseId = String(cfg.airtable_base_id || '');
-const tableName = String(cfg.airtable_table_name || 'Jobs Application Tracker');
+const mainTableName = String(cfg.airtable_table_name || 'Jobs Application Tracker');
+const sourceIndexTableName = String(
+  cfg.airtable_source_index_table_name || 'Source Job Index',
+);
 const rawTtl = cfg.airtable_schema_cache_ttl_seconds;
-let cacheTtlMs; 
+let cacheTtlMs;
 if (rawTtl === '' || rawTtl === null || rawTtl === undefined) {
   cacheTtlMs = 86400 * 1000;
 } else {
@@ -19,9 +22,9 @@ if (rawTtl === '' || rawTtl === null || rawTtl === undefined) {
 
 if (!pat) throw new Error('[00] Missing airtable_pat in shared config');
 if (!baseId) throw new Error('[00] Missing airtable_base_id in shared config');
-if (!tableName) throw new Error('[00] Missing airtable_table_name in shared config');
+if (!mainTableName) throw new Error('[00] Missing airtable_table_name in shared config');
 
-const cacheKey = `${SCHEMA_VERSION}\t${baseId}\t${tableName}`;
+const cacheKey = `${SCHEMA_VERSION}\t${baseId}\t${mainTableName}\t${sourceIndexTableName}`;
 let staticData = null;
 try {
   staticData = this.getWorkflowStaticData('global');
@@ -45,8 +48,8 @@ if (useCache) {
         cached: true,
         cache_age_ms: Date.now() - entry.at,
         cache_ttl_ms: cacheTtlMs,
-        table_name: tableName,
-        table_id: entry.tableId || null,
+        main_table: { name: mainTableName, id: entry.mainTableId || null },
+        source_index_table: { name: sourceIndexTableName, id: entry.sourceIndexTableId || null },
       },
     },
   };
@@ -84,7 +87,7 @@ const dateTimeOpts = {
   timeZone: 'utc',
 };
 
-const fieldDefs = [
+const mainFieldDefs = [
   { name: 'application_id', type: 'singleLineText' },
   { name: 'source_job_id', type: 'singleLineText' },
   { name: 'company', type: 'singleLineText' },
@@ -114,157 +117,223 @@ const fieldDefs = [
   { name: 'drive_folder_id', type: 'singleLineText' },
 ];
 
+// ── Source Job Index: tracks every external job_id we've ever fetched. ──
+// Sole purpose is feeding `job_id_not` to TheirStack so we never re-pay
+// credits for jobs we already pulled (whether they became packets or not).
+const sourceIndexFieldDefs = [
+  { name: 'source_job_id', type: 'singleLineText' },
+  { name: 'source', type: 'singleLineText' },
+  { name: 'date_fetched', type: 'date', options: dateOpts },
+  { name: 'outcome', type: 'singleLineText' },
+  { name: 'company', type: 'singleLineText' },
+  { name: 'job_title', type: 'singleLineText' },
+  // Set when Workflow 02 marks the row PROCESSED (after Azure fit scoring).
+  { name: 'fit_score', type: 'number', options: { precision: 0 } },
+  // Full normalized job payload as JSON. Stored at fetch time so the
+  // "Pull Stale FETCHED" branch can replay items whose scoring loop
+  // crashed in a prior run, without depending on the source APIs to
+  // return them again (most are filtered to ≤1 day of postings, so
+  // they often won't). Long text — Airtable accepts up to ~100k chars
+  // per cell; typical job payload is 5–20 KB.
+  { name: 'payload_json', type: 'multilineText' },
+];
+
 const metaUrl = `https://api.airtable.com/v0/meta/bases/${baseId}/tables`;
 
-let meta;
+async function fetchTablesMeta() {
+  return this.helpers.httpRequest({ method: 'GET', url: metaUrl, headers, json: true });
+}
+
+/**
+ * Bootstraps a single Airtable table to match the given fieldDefs.
+ * - Creates the table if missing.
+ * - Adds any missing fields.
+ * - Patches type changes (best-effort).
+ * - Adds singleSelect choices via the records API (Meta API PATCH for choices is unreliable).
+ *
+ * Mutates `fieldsUpdatedAcc` with human-readable action notes for the response.
+ * Returns { table, created, fieldsAdded }.
+ */
+async function bootstrapTable(tablesMeta, tableName, fieldDefs, fieldsUpdatedAcc) {
+  const tables = Array.isArray(tablesMeta?.tables) ? tablesMeta.tables : [];
+  const norm = (s) => String(s || '').trim();
+  const want = norm(tableName);
+  let table = tables.find((t) => norm(t?.name) === want);
+  let created = false;
+
+  if (!table) {
+    // Create with primary field only — batching all fields in one POST often returns 422.
+    try {
+      table = await this.helpers.httpRequest({
+        method: 'POST',
+        url: metaUrl,
+        headers,
+        body: {
+          name: tableName.trim(),
+          fields: [{ name: fieldDefs[0].name, type: 'singleLineText' }],
+        },
+        json: true,
+      });
+      created = true;
+    } catch (err) {
+      let metaRetry;
+      try {
+        metaRetry = await this.helpers.httpRequest({
+          method: 'GET',
+          url: metaUrl,
+          headers,
+          json: true,
+        });
+      } catch {
+        metaRetry = null;
+      }
+      table = (Array.isArray(metaRetry?.tables) ? metaRetry.tables : []).find(
+        (t) => norm(t?.name) === want,
+      );
+      if (!table) {
+        throw new Error(
+          `[00] Airtable create-table failed for "${tableName}". HTTP 422 is an invalid request from Airtable — it is not proof your PAT lacks schema.bases:write (GET /meta already proved read access). ` +
+            `Re-import workflow 00 so this node is up to date. Full detail: ${formatHttpErr(err)}`,
+        );
+      }
+    }
+  }
+
+  const tableId = table.id;
+  const existingFields = table.fields || [];
+  const existingByName = new Map(existingFields.map((f) => [f.name, f]));
+
+  // --- Phase 1: Create missing fields ---
+  const missing = fieldDefs.filter((f) => !existingByName.has(f.name));
+  for (const field of missing) {
+    try {
+      await this.helpers.httpRequest({
+        method: 'POST',
+        url: `https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tableId}/fields`,
+        headers,
+        body: field,
+        json: true,
+      });
+    } catch (err) {
+      throw new Error(
+        `[00] Failed creating field "${field.name}" on "${tableName}". ${formatHttpErr(err)}`,
+      );
+    }
+  }
+
+  const fieldMetaUrl = `https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tableId}/fields`;
+  const tableApiUrl = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}`;
+
+  // --- Phase 2: Type changes (e.g. singleLineText → url, text → singleSelect) ---
+  for (const def of fieldDefs) {
+    const cur = existingByName.get(def.name);
+    if (!cur || cur.type === def.type) continue;
+    try {
+      await this.helpers.httpRequest({
+        method: 'PATCH',
+        url: `${fieldMetaUrl}/${cur.id}`,
+        headers,
+        body: { type: def.type, ...(def.options ? { options: def.options } : {}) },
+        json: true,
+      });
+      fieldsUpdatedAcc.push(`[${tableName}] ${def.name}: ${cur.type} → ${def.type}`);
+    } catch (err) {
+      fieldsUpdatedAcc.push(
+        `[${tableName}] ${def.name}: type change ${cur.type} → ${def.type} skipped (${formatHttpErr(err)})`,
+      );
+    }
+  }
+
+  // --- Phase 3: singleSelect choices ---
+  for (const def of fieldDefs) {
+    if (def.type !== 'singleSelect') continue;
+    const cur = existingByName.get(def.name);
+    if (!cur) continue;
+
+    const desired = Array.isArray(def.options?.choices) ? def.options.choices : [];
+    const current = Array.isArray(cur.options?.choices) ? cur.options.choices : [];
+    const have = new Set(current.map((c) => String(c?.name || '').trim()).filter(Boolean));
+    const need = desired.filter((c) => !have.has(String(c?.name || '').trim()));
+    if (!need.length) continue;
+
+    for (const choice of need) {
+      const name = String(choice?.name || '').trim();
+      if (!name) continue;
+      try {
+        const created = await this.helpers.httpRequest({
+          method: 'POST',
+          url: tableApiUrl,
+          headers,
+          body: {
+            records: [{ fields: { [fieldDefs[0].name]: `_SCHEMA_SEED_${Date.now()}`, [def.name]: name } }],
+            typecast: true,
+          },
+          json: true,
+        });
+        const rid = created?.records?.[0]?.id;
+        if (rid) {
+          await this.helpers.httpRequest({
+            method: 'DELETE',
+            url: `${tableApiUrl}/${rid}`,
+            headers,
+            json: true,
+          });
+        }
+        fieldsUpdatedAcc.push(`[${tableName}] ${def.name}: added choice "${name}"`);
+      } catch (err) {
+        throw new Error(
+          `[00] Failed adding "${name}" to ${def.name} on ${tableName}: ${formatHttpErr(err)}`,
+        );
+      }
+    }
+  }
+
+  return {
+    table,
+    tableId,
+    created,
+    fieldsAdded: missing.map((f) => f.name),
+  };
+}
+
+let tablesMeta;
 try {
-  meta = await this.helpers.httpRequest({
-    method: 'GET',
-    url: metaUrl,
-    headers,
-    json: true,
-  });
+  tablesMeta = await fetchTablesMeta.call(this);
 } catch (err) {
   throw new Error(`[00] Airtable metadata GET failed. ${formatHttpErr(err)}`);
 }
 
-const tables = Array.isArray(meta?.tables) ? meta.tables : [];
-const norm = (s) => String(s || '').trim();
-const want = norm(tableName);
-let table = tables.find((t) => norm(t?.name) === want);
-
-if (!table) {
-  // Create table with primary field only — batching all fields in one POST often returns 422.
-  try {
-    table = await this.helpers.httpRequest({
-      method: 'POST',
-      url: metaUrl,
-      headers,
-      body: {
-        name: tableName.trim(),
-        fields: [{ name: 'application_id', type: 'singleLineText' }],
-      },
-      json: true,
-    });
-  } catch (err) {
-    let metaRetry;
-    try {
-      metaRetry = await this.helpers.httpRequest({
-        method: 'GET',
-        url: metaUrl,
-        headers,
-        json: true,
-      });
-    } catch {
-      metaRetry = null;
-    }
-    table = (Array.isArray(metaRetry?.tables) ? metaRetry.tables : []).find(
-      (t) => norm(t?.name) === want,
-    );
-    if (!table) {
-      throw new Error(
-        `[00] Airtable create-table failed. HTTP 422 is an invalid request from Airtable — it is not proof your PAT lacks schema.bases:write (GET /meta already proved read access). ` +
-          `Re-import workflow 00 so this node is up to date. Full detail: ${formatHttpErr(err)}`,
-      );
-    }
-  }
-}
-
-const tableId = table.id;
-const existingFields = table.fields || [];
-const existingByName = new Map(existingFields.map((f) => [f.name, f]));
-// --- Phase 1: Create missing fields ---
-const missing = fieldDefs.filter((f) => !existingByName.has(f.name));
-
-for (const field of missing) {
-  try {
-    await this.helpers.httpRequest({
-      method: 'POST',
-      url: `https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tableId}/fields`,
-      headers,
-      body: field,
-      json: true,
-    });
-  } catch (err) {
-    throw new Error(`[00] Failed creating field "${field.name}" on "${tableName}". ${formatHttpErr(err)}`);
-  }
-}
-
-const fieldMetaUrl = `https://api.airtable.com/v0/meta/bases/${baseId}/tables/${tableId}/fields`;
-const tableApiUrl = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}`;
 const fieldsUpdated = [];
 
-// --- Phase 2: Type changes (e.g. singleLineText → url, text → singleSelect) ---
-// Meta API PATCH works for most valid conversions. Non-fatal: if Airtable rejects
-// it we log and move on — the field still works, just with the old type.
-for (const def of fieldDefs) {
-  const cur = existingByName.get(def.name);
-  if (!cur || cur.type === def.type) continue;
-  try {
-    await this.helpers.httpRequest({
-      method: 'PATCH',
-      url: `${fieldMetaUrl}/${cur.id}`,
-      headers,
-      body: { type: def.type, ...(def.options ? { options: def.options } : {}) },
-      json: true,
-    });
-    fieldsUpdated.push(`${def.name}: ${cur.type} → ${def.type}`);
-  } catch (err) {
-    fieldsUpdated.push(`${def.name}: type change ${cur.type} → ${def.type} skipped (${formatHttpErr(err)})`);
-  }
+const main = await bootstrapTable.call(
+  this,
+  tablesMeta,
+  mainTableName,
+  mainFieldDefs,
+  fieldsUpdated,
+);
+
+// Refetch meta so the source-index bootstrap sees freshly-created tables/fields from main.
+try {
+  tablesMeta = await fetchTablesMeta.call(this);
+} catch (err) {
+  throw new Error(`[00] Airtable metadata refetch failed. ${formatHttpErr(err)}`);
 }
 
-// --- Phase 3: Select choices ---
-// Uses Records API with typecast:true (Airtable auto-creates the option),
-// then deletes the temp record. The Meta API PATCH for select choices returns
-// 422 on many plan/PAT configurations, so this is the only reliable approach.
-
-for (const def of fieldDefs) {
-  if (def.type !== 'singleSelect') continue;
-  const cur = existingByName.get(def.name);
-  if (!cur) continue;
-
-  const desired = Array.isArray(def.options?.choices) ? def.options.choices : [];
-  const current = Array.isArray(cur.options?.choices) ? cur.options.choices : [];
-  const have = new Set(current.map((c) => String(c?.name || '').trim()).filter(Boolean));
-  const need = desired.filter((c) => !have.has(String(c?.name || '').trim()));
-  if (!need.length) continue;
-
-  for (const choice of need) {
-    const name = String(choice?.name || '').trim();
-    if (!name) continue;
-    try {
-      const created = await this.helpers.httpRequest({
-        method: 'POST',
-        url: tableApiUrl,
-        headers,
-        body: {
-          records: [{ fields: { application_id: `_SCHEMA_SEED_${Date.now()}`, [def.name]: name } }],
-          typecast: true,
-        },
-        json: true,
-      });
-      const rid = created?.records?.[0]?.id;
-      if (rid) {
-        await this.helpers.httpRequest({
-          method: 'DELETE',
-          url: `${tableApiUrl}/${rid}`,
-          headers,
-          json: true,
-        });
-      }
-      fieldsUpdated.push(`${def.name}: added choice "${name}"`);
-    } catch (err) {
-      throw new Error(`[00] Failed adding "${name}" to ${def.name}: ${formatHttpErr(err)}`);
-    }
-  }
-}
+const sourceIndex = await bootstrapTable.call(
+  this,
+  tablesMeta,
+  sourceIndexTableName,
+  sourceIndexFieldDefs,
+  fieldsUpdated,
+);
 
 if (staticData && cacheTtlMs > 0) {
   staticData.airtableBootstrapCache = {
     key: cacheKey,
     at: Date.now(),
-    tableId,
+    mainTableId: main.tableId,
+    sourceIndexTableId: sourceIndex.tableId,
   };
 }
 
@@ -273,10 +342,18 @@ return {
     ...cfg,
     _airtable_bootstrap: {
       cached: false,
-      table_name: tableName,
-      table_id: tableId,
-      created_table: !tables.find((t) => norm(t?.name) === want),
-      fields_added: missing.map((f) => f.name),
+      main_table: {
+        name: mainTableName,
+        id: main.tableId,
+        created: main.created,
+        fields_added: main.fieldsAdded,
+      },
+      source_index_table: {
+        name: sourceIndexTableName,
+        id: sourceIndex.tableId,
+        created: sourceIndex.created,
+        fields_added: sourceIndex.fieldsAdded,
+      },
       fields_updated: fieldsUpdated,
       cache_ttl_ms: cacheTtlMs,
     },

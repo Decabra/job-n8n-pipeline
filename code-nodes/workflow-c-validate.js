@@ -8,7 +8,7 @@ const fit = Number(fields.fit_score) || 0;
 
 const errors = [];
 if (status !== S.READY_TO_SUBMIT) errors.push(`status_not_ready:${status}`);
-if (fit < 85) errors.push('fit_below_85');
+if (fit < 75) errors.push('fit_below_75');
 if (!fields.application_url) errors.push('missing_application_url');
 if (!fields.resume_link) errors.push('missing_resume_link');
 

@@ -27,7 +27,7 @@ const lines = [
   '<b>Resume changes:</b>',
   changes || '  (none)',
   '',
-  `${link(j.application_url, 'Apply')} · ${link(j.resume_link, 'Resume')}`,
+  `${link(j.application_url, 'Apply')} · ${link(j.resume_link, 'Resume')} · ${link(j.cover_letter_link, 'Cover Letter')}`,
 ];
 
 const body = {

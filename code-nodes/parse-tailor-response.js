@@ -11,7 +11,6 @@ try {
     fit_summary: '',
     key_resume_changes: [],
     visa_notes: '',
-    cover_letter: null,
     ats_keywords_added: [],
   };
 }
@@ -25,7 +24,6 @@ return {
     fit_summary: parsed.fit_summary || '',
     key_resume_changes: parsed.key_resume_changes || [],
     visa_notes: parsed.visa_notes || '',
-    cover_letter: parsed.cover_letter || null,
     ats_keywords_added: parsed.ats_keywords_added || [],
   },
 };

@@ -8,7 +8,7 @@ const postingQuality = Number(raw.posting_quality) || 0;
 const careerTrajectory = Number(raw.career_trajectory) || 0;
 const hasRejection = raw.rejection_reason != null && raw.rejection_reason !== '';
 
-let bucket = s >= 85 ? 'packet' : 'reject';
+let bucket = s >= 75 ? 'packet' : 'reject';
 
 if (seniorityScore <= 2) bucket = 'reject';
 if (visaSafety <= 3) bucket = 'reject';

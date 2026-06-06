@@ -88,19 +88,23 @@ This reads every file in `code-nodes/`, embeds them into n8n workflow JSON, and 
 Import the generated JSON files **in order**:
 
 1. `00-shared-config.json` — open the **Config** Set node and fill in your secrets/settings
-2. `01-source-score-package.json`
-3. `02-telegram-approval.json`
-4. `03-submission-executor.json`
-5. `04-reporting.json`
-6. `05-manual-url-intake.json`
+2. `01-job-sourcing.json` — fetch, merge, Source Job Index, then calls **02**
+3. `02-job-score-package.json` — score, tailor, packet, Telegram preview
+4. `03-telegram-approval.json`
+5. `04-submission-executor.json`
+6. `05-reporting.json`
+7. `06-manual-url-intake.json`
+
+There are **seven** files: former **01** alone became **01** (sourcing) + **02** (scoring), so what used to be `02`–`05` are now `03`–`06`. If you still have old exports from before the split (e.g. `01-source-score-package.json` alongside `01-job-sourcing.json`), delete the stale JSONs manually so only this set remains.
 
 After importing:
 
 - Copy the **Workflow 00** ID from the n8n URL bar → update the **Fetch Config** node in each workflow to point to it
 - Open each **Airtable** and **Azure Storage** node → attach your n8n credentials
-- Copy the **Workflow 03** ID → set `SUBMISSION_WORKFLOW_ID` in n8n env (or pick it in Workflow 02's Execute Workflow node)
+- Copy the **Workflow 02** ID → set `scoring_workflow_id` in the 00 **Config** Set node (or your env bridge)
+- Copy the **Workflow 04** ID → set `submission_workflow_id` in 00 Config (the Telegram workflow’s Execute node also reads this from Config)
 - Set your base resume as `BASE_RESUME_TEXT` in the Config node (Markdown format)
-- Activate Workflow **02** (Telegram trigger) and **01** (schedule) when ready
+- Activate Workflow **03** (Telegram trigger) and **01** (schedule) when ready
 
 ### 5. Telegram interaction
 
@@ -118,8 +122,8 @@ The `/fix` command accepts inline corrections:
 
 ## Current limitations
 
-- **Auto-submit is off.** Workflow 03 classifies the ATS but sets `MANUAL_REQUIRED` and sends you apply/resume links. Actual form submission is not automated.
-- **NEEDS_FIX re-tailor** requires extending Workflow 02 with LLM + Storage nodes (the patterns mirror Workflow 01).
+- **Auto-submit is off.** Workflow 04 classifies the ATS but sets `MANUAL_REQUIRED` and sends you apply/resume links. Actual form submission is not automated.
+- **NEEDS_FIX re-tailor** requires extending Workflow 03 with LLM + Storage nodes (the patterns mirror Workflow 02).
 
 ## License
 

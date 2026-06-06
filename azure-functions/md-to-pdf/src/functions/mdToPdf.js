@@ -30,30 +30,38 @@ app.http('mdToPdf', {
       };
     }
 
+    const type = body && typeof body.type === 'string' ? body.type : 'resume';
+    const dispositionName = type === 'cover_letter' ? 'cover_letter.pdf' : 'tailored_resume.pdf';
+
     try {
-      const pdf = await markdownToPdf(markdown);
+      const pdf = await markdownToPdf(markdown, type);
       return {
         status: 200,
         headers: {
           'Content-Type': 'application/pdf',
-          'Content-Disposition': 'inline; filename="tailored_resume.pdf"',
+          'Content-Disposition': `inline; filename="${dispositionName}"`,
         },
         body: pdf,
       };
     } catch (err) {
       const status = err.status || 500;
-      context.log('Conversion failed: ' + (err && err.message ? err.message : String(err)));
+      const msg = err && err.message ? err.message : String(err);
+      context.log('Conversion failed: ' + msg);
+      if (err && err.stack) context.log(err.stack.slice(0, 2000));
       if (status === 400 || status === 413) {
         return {
           status,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: err.message }),
+          body: JSON.stringify({ error: msg }),
         };
       }
       return {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'PDF conversion failed' }),
+        body: JSON.stringify({
+          error: 'PDF conversion failed',
+          detail: msg,
+        }),
       };
     }
   },
