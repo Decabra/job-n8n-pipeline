@@ -11,9 +11,8 @@ Markdown ──────► HTML + CSS template ──────► PDF buf
 ```
 
 - **markdown-it** — Markdown → HTML parsing.
-- **Playwright + Chromium** — headless browser renders styled HTML to PDF. A **singleton browser instance** is reused across requests (only the first request pays the ~1–3 s Chromium launch cost).
-- **pdf-lib** — parses the generated PDF to validate exactly one page.
-- **CSS template** — calibrated for US Letter, 0.5 in margins, 10 pt font; fits ~450–500 words on a single page.
+- **Playwright + Chromium** — headless browser renders styled HTML to PDF. Experience roles (`h3` + bullets) are wrapped in unbreakable table shells **after** markdown-it renders (injecting tables in markdown source does not work). A virtual-page pass adds `page-break-before` when a role would straddle the page bottom.
+- **CSS template** — US Letter, 0.5 in body padding, 10 pt font; resumes are typically 2 pages when tailored.
 
 ## API
 
@@ -22,7 +21,7 @@ Markdown ──────► HTML + CSS template ──────► PDF buf
 | **Endpoint** | `POST /api/md-to-pdf` |
 | **Auth** | Function key via `?code=` query param (`authLevel: function`) |
 | **Request body** | `{ "markdown": "# Jane Doe\n\n## Skills\n..." }` |
-| **Success** | `200`, `Content-Type: application/pdf`, body = raw PDF bytes |
+| **Success** | `200`, `Content-Type: application/pdf`, `X-Resume-Pdf-Version` header (layout version), body = raw PDF bytes |
 | **Errors** | `400` bad/missing body, `413` markdown too large, `500` internal |
 
 ## Deployment
@@ -104,7 +103,23 @@ curl -s -w "\nHTTP=%{http_code} SIZE=%{size_download} TIME=%{time_total}s" \
   -o test-output.pdf
 ```
 
-Expected: `HTTP=200`, size ~15–25 KB, time ~1–3 s. Open `test-output.pdf` to verify a single-page resume.
+Expected: `HTTP=200`, header `X-Resume-Pdf-Version: 2026-06-27-role-shells` (or newer), size ~15–80 KB.
+
+**Verify deploy after push:** if your pipeline PDF still splits experience bullets across pages, the Azure container is almost certainly still running an old image. Check the version header:
+
+```bash
+curl -sD - -o /dev/null -X POST "https://YOUR_APP.azurewebsites.net/api/md-to-pdf?code=YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"markdown":"# Test\n\n## Experience\n\n### Engineer, ACME *Remote · 2024*\n\n- Bullet one\n- Bullet two"}' \
+  | grep -i x-resume-pdf-version
+```
+
+Run layout regression locally before pushing:
+
+```bash
+cd azure-functions/md-to-pdf
+npm test
+```
 
 ### Redeploying after code changes
 
@@ -116,9 +131,43 @@ docker push YOUR_ACR.azurecr.io/md-to-pdf:latest
 az functionapp restart --name YOUR_APP --resource-group YOUR_RG
 ```
 
-## Local development
+## Local development (validate before every deploy)
 
-Prerequisites: [Azure Functions Core Tools v4](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local), Node 20.
+**Do not push to Azure until `npm test` passes.** The test runs the same `markdownToPdf` code as production, writes a real PDF, extracts text per page, and fails if any experience role splits across pages (the Une Soumission bug).
+
+Prerequisites: Node 20, Chromium for Playwright.
+
+```bash
+cd azure-functions/md-to-pdf
+npm ci
+npx playwright install chromium
+npm test
+```
+
+What `npm test` checks against `resumes/Sarmad_Sohail_Resume.md` (repo source of truth — same content as n8n `base_resume_text`):
+
+- Experience roles do not split across pages
+- Every `[text](url)` markdown link is embedded in the PDF
+
+Render for manual inspection (defaults to the same resume file):
+
+```bash
+npm run render
+# → out/resume-preview.pdf
+
+npm run render -- ../../../resumes/Sarmad_Sohail_Resume.md -o /tmp/resume.pdf
+```
+
+### Why page breaks are annoying
+
+Chromium's PDF engine treats `page-break-inside: avoid` as a **hint**, not a rule. A plain `h3` + `ul` pair will soft-break between bullets when the role lands near the page bottom. Markdown-in-HTML-table tricks fail because markdown-it closes HTML blocks before `###` headings. The fix is two steps only:
+
+1. Wrap each `h3 + ul` in a table shell **after** markdown-it renders (`resumeBlocks.js`)
+2. If a shell would straddle a page, add `page-break-before: always` on the whole block (`applyResumePageBreaks`)
+
+### Azure Functions local HTTP (optional)
+
+Prerequisites: [Azure Functions Core Tools v4](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local).
 
 ```bash
 cd azure-functions/md-to-pdf
@@ -138,7 +187,7 @@ Test against `http://localhost:7071/api/md-to-pdf`.
 | **404 Not Found** | Container still starting. Wait for `Application started` in logs. |
 | **Requests hang** | Container restarting or image being pulled. Check docker logs. Restart with `az functionapp restart`. |
 | **Empty `DOCKER_REGISTRY_SERVER_PASSWORD`** | ACR password wasn't saved during creation. Re-set it in app settings. |
-| **Chromium missing at runtime** | Dockerfile must run `npx playwright install chromium --with-deps`. Verify `PLAYWRIGHT_BROWSERS_PATH` matches. |
+| **Experience role split across pages** | Redeploy Docker image (see above) and confirm `X-Resume-Pdf-Version` header. Old images had no post-render role wrapping. |
 
 ## Security
 

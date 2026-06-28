@@ -5,11 +5,16 @@
   "main": "src/index.js",
   "scripts": {
     "start": "func start",
-    "test": "echo \"No tests\" && exit 0"
+    "test": "node scripts/e2e-pdf-layout.cjs",
+    "render": "node scripts/render-resume.cjs",
+    "validate": "npm test"
   },
   "dependencies": {
     "@azure/functions": "^4.6.0",
     "markdown-it": "^14.1.0",
     "playwright-core": "^1.49.1"
+  },
+  "devDependencies": {
+    "pdfjs-dist": "^4.10.38"
   }
 }

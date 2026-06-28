@@ -1,7 +1,7 @@
 'use strict';
 
 const { app } = require('@azure/functions');
-const { markdownToPdf } = require('../convertToPdf');
+const { markdownToPdf, CONVERTER_VERSION } = require('../convertToPdf');
 
 app.http('mdToPdf', {
   methods: ['POST'],
@@ -40,6 +40,7 @@ app.http('mdToPdf', {
         headers: {
           'Content-Type': 'application/pdf',
           'Content-Disposition': `inline; filename="${dispositionName}"`,
+          'X-Resume-Pdf-Version': CONVERTER_VERSION,
         },
         body: pdf,
       };

@@ -2,7 +2,10 @@
 
 const { chromium } = require('playwright-core');
 const MarkdownIt = require('markdown-it');
-const { injectResumeBlockTables } = require('./resumeBlocks');
+const { wrapExperienceRoleBlocks } = require('./resumeBlocks');
+
+/** Bump when PDF layout logic changes — check response header X-Resume-Pdf-Version after deploy. */
+const CONVERTER_VERSION = '2026-06-28-page-margins';
 
 const md = new MarkdownIt({
   html: true,
@@ -14,6 +17,10 @@ const MAX_MARKDOWN_BYTES = 200_000;
 const PAGE_HEIGHT_PX = 11 * 96;
 const PAGE_MARGIN_PX = 0.5 * 96;
 const RESUME_PAGE_CONTENT_PX = PAGE_HEIGHT_PX - 2 * PAGE_MARGIN_PX;
+/** If a role starts below this Y on a page, move the whole block to the next page. */
+const ROLE_BOTTOM_ZONE_PX = Math.round(RESUME_PAGE_CONTENT_PX * 0.78);
+/** Extra slack — print layout is often taller than screen getBoundingClientRect(). */
+const ROLE_PRINT_SLOP_PX = 48;
 
 let browserInstance = null;
 
@@ -43,7 +50,7 @@ function wrapResumeHtml(bodyHtml) {
   <meta charset="utf-8" />
   <title>Resume</title>
   <style>
-    @page { size: letter; margin: 0; }
+    @page { size: letter; margin: ${PAGE_MARGIN_PX}px; }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
     body {
@@ -51,7 +58,6 @@ function wrapResumeHtml(bodyHtml) {
       font-size: 10pt;
       line-height: 1.35;
       color: #111;
-      padding: ${PAGE_MARGIN_PX}px;
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
     }
@@ -88,9 +94,14 @@ function wrapResumeHtml(bodyHtml) {
       flex-shrink: 1;
       line-height: 1.25;
     }
-    /* Single-cell table = reliable page-break-inside:avoid in Chromium PDF */
     .resume-block-shell {
       width: 100%;
+      page-break-inside: avoid;
+      break-inside: avoid-page;
+    }
+    .resume-block-shell.force-next-page {
+      page-break-before: always;
+      break-before: page;
     }
     table.resume-block {
       width: 100%;
@@ -106,7 +117,11 @@ function wrapResumeHtml(bodyHtml) {
     }
     .resume p { margin: 2pt 0; orphans: 2; widows: 2; }
     .resume ul, .resume ol { margin: 2pt 0; padding-left: 16pt; }
-    .resume li { margin-bottom: 1pt; page-break-inside: avoid; break-inside: avoid-page; }
+    .resume li {
+      margin-bottom: 1pt;
+      page-break-inside: avoid;
+      break-inside: avoid-page;
+    }
     .resume strong { font-weight: 600; }
     .resume a {
       color: #0b57d0;
@@ -129,62 +144,58 @@ function wrapResumeHtml(bodyHtml) {
 }
 
 /**
- * If a block's top and bottom land on different pages in print layout, push the
- * whole shell down with margin-top so it starts on the next page.
+ * Chromium print layout ignores page-break-inside:avoid on plain h3+ul pairs and
+ * will orphan the second bullet at a page boundary. Two steps fix it:
+ *
+ * 1. wrapExperienceRoleBlocks (resumeBlocks.js) — table shell after markdown-it
+ * 2. This pass — if a shell would straddle the page bottom, set page-break-before
+ *
+ * We measure in print media; printSlop compensates for minor screen vs PDF drift.
  */
 async function applyResumePageBreaks(page) {
   await page.emulateMedia({ media: 'print' });
   await page.evaluate(() => document.fonts.ready);
 
-  await page.evaluate(({ contentH }) => {
+  await page.evaluate(({ contentH, bottomZone, printSlop }) => {
     const root = document.querySelector('.resume');
     if (!root) return;
 
-    const shells = [...root.querySelectorAll('.resume-block-shell')];
-    const rootTop = root.getBoundingClientRect().top;
-
-    function pageIndex(y) {
-      return Math.floor((y - rootTop) / contentH);
-    }
-
-    function blockStraddles(el) {
-      const r = el.getBoundingClientRect();
-      if (r.height > contentH) return false;
-      const topPage = pageIndex(r.top);
-      const bottomPage = pageIndex(r.bottom - 0.5);
-      return topPage !== bottomPage;
-    }
-
-    function remainingSpace(y) {
-      const pos = (y - rootTop) % contentH;
-      return pos === 0 ? contentH : contentH - pos;
-    }
-
-    for (let pass = 0; pass < 20; pass++) {
+    for (let pass = 0; pass < 8; pass++) {
+      const shells = [...root.querySelectorAll('.resume-block-shell')];
       let moved = false;
+
       for (const shell of shells) {
-        shell.style.marginTop = '';
+        shell.classList.remove('force-next-page');
       }
 
-      for (const shell of shells) {
-        const r = shell.getBoundingClientRect();
-        const h = r.height;
-        if (h > contentH) continue;
+      let y = 0;
+      for (const child of root.children) {
+        const h = child.getBoundingClientRect().height;
+        const posOnPage = y % contentH;
+        const spaceLeft = posOnPage === 0 ? contentH : contentH - posOnPage;
 
-        const straddles = blockStraddles(shell);
-        const space = remainingSpace(r.top);
-        const wontFit = space < h - 0.5 && space < contentH;
+        if (child.classList.contains('resume-block-shell') && h <= contentH && posOnPage > 0) {
+          const inBottomZone = posOnPage >= bottomZone;
+          const tightFit = h > spaceLeft + 1 || spaceLeft < h + printSlop;
+          const spansVirtualPage = posOnPage + h > contentH - 1;
 
-        if (straddles || wontFit) {
-          shell.style.marginTop = `${space}px`;
-          moved = true;
-          break;
+          if (inBottomZone || tightFit || spansVirtualPage) {
+            child.classList.add('force-next-page');
+            moved = true;
+            y = Math.ceil(y / contentH) * contentH;
+          }
         }
+
+        y += h;
       }
 
       if (!moved) break;
     }
-  }, { contentH: RESUME_PAGE_CONTENT_PX });
+  }, {
+    contentH: RESUME_PAGE_CONTENT_PX,
+    bottomZone: ROLE_BOTTOM_ZONE_PX,
+    printSlop: ROLE_PRINT_SLOP_PX,
+  });
 }
 
 function wrapCoverLetterHtml(bodyHtml) {
@@ -206,13 +217,7 @@ function wrapCoverLetterHtml(bodyHtml) {
       print-color-adjust: exact;
     }
     .letter { max-width: 7in; }
-    .letter h1 {
-      font-size: 16pt;
-      font-weight: 600;
-      margin: 0 0 3pt 0;
-      line-height: 1.15;
-      letter-spacing: 0.2pt;
-    }
+    .letter h1 { font-size: 16pt; font-weight: 600; margin: 0 0 3pt 0; line-height: 1.15; }
     .letter h1 + p { margin: 0 0 4pt 0; font-size: 10pt; color: #444; }
     .letter hr { border: none; border-top: 1px solid #999; margin: 6pt 0 14pt 0; height: 0; }
     .letter h2 { font-size: 12pt; font-weight: 600; margin: 12pt 0 5pt 0; }
@@ -221,13 +226,7 @@ function wrapCoverLetterHtml(bodyHtml) {
     .letter li { margin-bottom: 2pt; }
     .letter strong { font-weight: 600; }
     .letter em { font-style: italic; }
-    .letter a {
-      color: #0b57d0;
-      text-decoration: underline;
-      text-underline-offset: 1.5pt;
-      text-decoration-thickness: 0.5pt;
-    }
-    .letter a:visited { color: #5b2c91; }
+    .letter a { color: #0b57d0; text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -236,11 +235,6 @@ function wrapCoverLetterHtml(bodyHtml) {
 </html>`;
 }
 
-/**
- * @param {string} markdown
- * @param {string} [type='resume']
- * @returns {Promise<Buffer>}
- */
 async function markdownToPdf(markdown, type) {
   const raw = String(markdown || '');
   if (!raw.trim()) {
@@ -254,8 +248,10 @@ async function markdownToPdf(markdown, type) {
     throw e;
   }
 
-  const prepared = type === 'cover_letter' ? raw : injectResumeBlockTables(raw);
-  const bodyHtml = md.render(prepared);
+  let bodyHtml = md.render(raw);
+  if (type !== 'cover_letter') {
+    bodyHtml = wrapExperienceRoleBlocks(bodyHtml);
+  }
   const html = type === 'cover_letter' ? wrapCoverLetterHtml(bodyHtml) : wrapResumeHtml(bodyHtml);
 
   const browser = await getBrowser();
@@ -279,11 +275,13 @@ async function markdownToPdf(markdown, type) {
 }
 
 module.exports = {
+  CONVERTER_VERSION,
   markdownToPdf,
   getBrowser,
-  injectResumeBlockTables,
+  wrapExperienceRoleBlocks,
   applyResumePageBreaks,
   PAGE_HEIGHT_PX,
   PAGE_MARGIN_PX,
   RESUME_PAGE_CONTENT_PX,
+  ROLE_BOTTOM_ZONE_PX,
 };
