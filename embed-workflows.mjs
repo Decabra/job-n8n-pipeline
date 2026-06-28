@@ -72,6 +72,21 @@ const BLOCKED_JOB_DOMAINS = blockedDomainsCtx.BLOCKED_JOB_DOMAINS;
 const BLOCKED_URL_DOMAIN_NOT = blockedDomainsCtx.BLOCKED_URL_DOMAIN_NOT;
 const JSEARCH_EXCLUDED_PUBLISHERS = blockedDomainsCtx.JSEARCH_EXCLUDED_PUBLISHERS;
 
+// Mega-employers to strip at the Fantastic source. Source Job Index data showed
+// Fantastic surfacing these and crowding out the Series A–C / mid-size / cap-
+// exempt roles the candidate actually has a shot at. Precise name exclusion =
+// zero yield risk for startups (unlike a blunt LinkedIn employee-count cap).
+// Used as Fantastic `organizationExclusionSearch` with ':*' prefix matching.
+// Tune freely; not an accusation, just where the candidate doesn't convert.
+const MEGACAP_ORG_EXCLUDE = [
+  'Google', 'Alphabet', 'Amazon', 'Apple', 'Microsoft', 'Meta', 'Facebook',
+  'Netflix', 'Nvidia', 'Oracle', 'Salesforce', 'Adobe', 'IBM', 'Intel', 'Cisco',
+  'Uber', 'Lyft', 'Airbnb', 'LinkedIn', 'TikTok', 'ByteDance', 'Walmart',
+  'JPMorgan', 'Goldman Sachs', 'Capgemini', 'Deloitte', 'Accenture', 'Cognizant',
+  'Infosys', 'Wipro', 'Tata Consultancy', 'UnitedHealth',
+];
+const MEGACAP_ORG_EXCLUDE_PREFIXED = MEGACAP_ORG_EXCLUDE.map((n) => `${n}:*`);
+
 const SRC = {
   explode:       read('explode-jsearch.js'),
   explodeApify:  read('explode-apify-dataset.js'),
@@ -236,8 +251,22 @@ function build00() {
         { id: 'c7j', name: 'job_search_queries',      value: E('JOB_SEARCH_QUERIES', 'YOUR_SEARCH_QUERIES'), type: 'string' },
         { id: 'c7a', name: 'apify_token',             value: E('APIFY_TOKEN', 'YOUR_APIFY_TOKEN'),         type: 'string' },
         { id: 'c7v', name: 'theirstack_api_key',      value: E('THEIRSTACK_API_KEY', 'YOUR_THEIRSTACK_API_KEY'),  type: 'string' },
-        { id: 'c7w', name: 'theirstack_limit',        value: E('THEIRSTACK_LIMIT', '10'),                     type: 'string' },
+        // TheirStack is our precision startup/funding-aware source. It was
+        // starved (limit 10 + 1-day window + 500-emp cap) and returned ~nothing.
+        // Raise volume + widen the window; cost is per returned job so tune to taste.
+        { id: 'c7w', name: 'theirstack_limit',        value: E('THEIRSTACK_LIMIT', '25'),                     type: 'string' },
+        { id: 'c7y', name: 'theirstack_max_age_days', value: E('THEIRSTACK_MAX_AGE_DAYS', '7'),               type: 'string' },
+        // Mid-size ceiling for the firmographic sources. Series A–C + mid-size
+        // typically sit well under this; raising past ~2000 starts pulling
+        // big-tech back in. TheirStack uses native firmographics (safe).
+        { id: 'c7z', name: 'theirstack_max_employees', value: E('THEIRSTACK_MAX_EMPLOYEES', '2000'),          type: 'string' },
         { id: 'c7x', name: 'fantastic_jobs_limit',    value: E('FANTASTIC_JOBS_LIMIT', '50'),                     type: 'string' },
+        // Fantastic LinkedIn-based size cap. OFF by default ('' or 0): the LI
+        // employee-count filter drops jobs whose company LinkedIn match has no
+        // employee data — that can silently kill real startups. Megacaps are
+        // already stripped by name (MEGACAP_ORG_EXCLUDE). Set a number (e.g.
+        // 2000) only if big names still leak through, and watch yield.
+        { id: 'c7f', name: 'fantastic_max_employees', value: E('FANTASTIC_MAX_EMPLOYEES', ''),                type: 'string' },
         { id: 'c8',  name: 'base_resume_text',        value: E('BASE_RESUME_TEXT', 'PASTE_YOUR_FULL_RESUME_HERE'), type: 'string' },
         { id: 'c8a', name: 'candidate_name',          value: E('CANDIDATE_NAME', 'YOUR_NAME'),                 type: 'string' },
         { id: 'c8b', name: 'candidate_contact_line',  value: E('CANDIDATE_CONTACT_LINE', 'email · phone · LinkedIn URL'), type: 'string' },
@@ -329,7 +358,7 @@ function buildSourcing() {
       url: `={{ 'https://api.apify.com/v2/acts/fantastic-jobs~career-site-job-listing-api/runs?waitForFinish=180&token=' + encodeURIComponent($('Config').first().json.apify_token || '') }}`,
       sendBody: true,
       specifyBody: 'json',
-      jsonBody: `={{ JSON.stringify({ timeRange: '24h', limit: Math.max(10, Number($('Config').first().json.fantastic_jobs_limit || 50)), includeAi: true, descriptionType: 'text', removeAgency: true, domainExclusionFilter: ${JSON.stringify(BLOCKED_JOB_DOMAINS)}, organizationExclusionSearch: ['beBee:*', 'recruit.net', 'JobLeads:*'], titleSearch: ['AI engineer', 'ML engineer', 'LLM engineer', 'machine learning engineer', 'applied AI', 'agent engineer', 'gen AI', 'AI platform', 'data engineer', 'software engineer', 'backend engineer'], titleExclusionSearch: ['staff', 'principal', 'director', 'VP', 'head of', 'lead', 'distinguished', 'intern', 'co op'], descriptionExclusionSearch: ['security clearance', 'TS/SCI', 'polygraph', 'Public Trust', 'US citizens only', 'must be a US citizen', 'citizenship required', 'no visa sponsorship', 'without sponsorship', 'without current or future sponsorship'], aiExperienceLevelFilter: ['0-2', '2-5'], locationSearch: ['United States'], idExclusionFilter: $('Build Source Exclusions').first().json.fantastic_job_id_not || [] }) }}`,
+      jsonBody: `={{ JSON.stringify({ timeRange: '24h', limit: Math.max(10, Number($('Config').first().json.fantastic_jobs_limit || 50)), includeAi: true, descriptionType: 'text', removeAgency: true, domainExclusionFilter: ${JSON.stringify(BLOCKED_JOB_DOMAINS)}, organizationExclusionSearch: ${JSON.stringify(['beBee:*', 'recruit.net', 'JobLeads:*', ...MEGACAP_ORG_EXCLUDE_PREFIXED])}, titleSearch: ['AI engineer', 'ML engineer', 'LLM engineer', 'machine learning engineer', 'applied AI', 'agent engineer', 'gen AI', 'AI platform', 'data engineer', 'software engineer', 'backend engineer'], titleExclusionSearch: ['staff', 'principal', 'director', 'VP', 'head of', 'lead', 'distinguished', 'intern', 'co op'], descriptionExclusionSearch: ['security clearance', 'TS/SCI', 'polygraph', 'Public Trust', 'US citizens only', 'must be a US citizen', 'citizenship required', 'no visa sponsorship', 'without sponsorship', 'without current or future sponsorship'], aiExperienceLevelFilter: ['0-2', '2-5'], locationSearch: ['United States'], ...(Number($('Config').first().json.fantastic_max_employees || 0) > 0 ? { includeLinkedIn: true, liOrganizationEmployeesLte: Number($('Config').first().json.fantastic_max_employees) } : {}), idExclusionFilter: $('Build Source Exclusions').first().json.fantastic_job_id_not || [] }) }}`,
       options: { timeout: 300000 },
     }, { onError: 'continueRegularOutput', alwaysOutputData: true }),
     N('IF Fantastic Dataset', 'n8n-nodes-base.if', 2.2, [COL(4), Y.IF_BOT], {
@@ -378,7 +407,7 @@ function buildSourcing() {
       ]},
       sendBody: true,
       specifyBody: 'json',
-      jsonBody: `={{ JSON.stringify({ page: 0, limit: Number($('Config').first().json.theirstack_limit || 10), posted_at_max_age_days: 1, job_country_code_or: ['US'], job_seniority_or: ['junior', 'mid_level'], company_type: 'direct_employer', max_employee_count: 500, funding_stage_or: ['pre_seed', 'seed', 'series_a', 'series_b', 'early_vc', 'angel', 'venture_round_not_specified'], job_title_pattern_or: ['AI.engineer', 'ML.engineer', 'LLM.engineer', 'machine.learning.engineer', 'applied.AI', 'agent.engineer', 'gen.AI', 'AI.platform', 'data.engineer', 'software.engineer', 'backend.engineer'], job_title_pattern_not: ['staff', 'principal', 'director', 'VP', 'head.of', 'lead', 'distinguished', 'intern', 'co.op'], job_description_pattern_or: ['LLM', 'RAG', 'agentic', 'AI.agent', 'embedding', 'GPT', 'langchain', 'vector', 'FastAPI', 'Python', 'TypeScript', 'microservice', 'distributed.systems', 'ETL', 'data.pipeline', 'dbt', 'Airflow', 'Postgres', 'Azure'], job_description_pattern_not: ['security.clearance', 'TS/SCI', 'polygraph', 'Public.Trust', 'US.citizens.only', 'must.be.a.US.citizen', 'citizenship.required', 'no.visa.sponsorship', 'without.sponsorship', 'without.current.or.future.sponsorship'], job_description_pattern_is_case_insensitive: true, employment_statuses_or: ['full_time'], url_domain_not: ${JSON.stringify(BLOCKED_URL_DOMAIN_NOT)}, job_id_not: $('Build Source Exclusions').first().json.theirstack_job_id_not || [], include_total_results: false, order_by: [{ desc: true, field: 'date_posted' }, { desc: true, field: 'discovered_at' }] }) }}`,
+      jsonBody: `={{ JSON.stringify({ page: 0, limit: Number($('Config').first().json.theirstack_limit || 10), posted_at_max_age_days: Math.max(1, Number($('Config').first().json.theirstack_max_age_days || 7)), job_country_code_or: ['US'], job_seniority_or: ['junior', 'mid_level'], company_type: 'direct_employer', max_employee_count: Math.max(1, Number($('Config').first().json.theirstack_max_employees || 2000)), funding_stage_or: ['pre_seed', 'seed', 'series_a', 'series_b', 'series_c', 'early_vc', 'angel', 'venture_round_not_specified'], job_title_pattern_or: ['AI.engineer', 'ML.engineer', 'LLM.engineer', 'machine.learning.engineer', 'applied.AI', 'agent.engineer', 'gen.AI', 'AI.platform', 'data.engineer', 'software.engineer', 'backend.engineer'], job_title_pattern_not: ['staff', 'principal', 'director', 'VP', 'head.of', 'lead', 'distinguished', 'intern', 'co.op'], job_description_pattern_or: ['LLM', 'RAG', 'agentic', 'AI.agent', 'embedding', 'GPT', 'langchain', 'vector', 'FastAPI', 'Python', 'TypeScript', 'microservice', 'distributed.systems', 'ETL', 'data.pipeline', 'dbt', 'Airflow', 'Postgres', 'Azure'], job_description_pattern_not: ['security.clearance', 'TS/SCI', 'polygraph', 'Public.Trust', 'US.citizens.only', 'must.be.a.US.citizen', 'citizenship.required', 'no.visa.sponsorship', 'without.sponsorship', 'without.current.or.future.sponsorship'], job_description_pattern_is_case_insensitive: true, employment_statuses_or: ['full_time'], url_domain_not: ${JSON.stringify(BLOCKED_URL_DOMAIN_NOT)}, job_id_not: $('Build Source Exclusions').first().json.theirstack_job_id_not || [], include_total_results: false, order_by: [{ desc: true, field: 'date_posted' }, { desc: true, field: 'discovered_at' }] }) }}`,
       options: { timeout: 30000 },
     }, { onError: 'continueRegularOutput', alwaysOutputData: true }),
     codeAll('Explode TheirStack', [COL(7), Y.BOT], SRC.explodeTheirstack, { alwaysOutputData: true }),

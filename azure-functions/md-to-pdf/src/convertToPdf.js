@@ -2,14 +2,18 @@
 
 const { chromium } = require('playwright-core');
 const MarkdownIt = require('markdown-it');
+const { injectResumeBlockTables } = require('./resumeBlocks');
 
 const md = new MarkdownIt({
-  html: false,
+  html: true,
   linkify: true,
   typographer: false,
 });
 
 const MAX_MARKDOWN_BYTES = 200_000;
+const PAGE_HEIGHT_PX = 11 * 96;
+const PAGE_MARGIN_PX = 0.5 * 96;
+const RESUME_PAGE_CONTENT_PX = PAGE_HEIGHT_PX - 2 * PAGE_MARGIN_PX;
 
 let browserInstance = null;
 
@@ -39,7 +43,7 @@ function wrapResumeHtml(bodyHtml) {
   <meta charset="utf-8" />
   <title>Resume</title>
   <style>
-    @page { size: letter; margin: 0.5in; }
+    @page { size: letter; margin: 0; }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
     body {
@@ -47,11 +51,11 @@ function wrapResumeHtml(bodyHtml) {
       font-size: 10pt;
       line-height: 1.35;
       color: #111;
+      padding: ${PAGE_MARGIN_PX}px;
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
     }
     .resume { max-width: 7.5in; }
-    .resume:last-child { margin-bottom: 0; }
     .resume h1 {
       font-size: 16pt;
       font-weight: 600;
@@ -64,16 +68,11 @@ function wrapResumeHtml(bodyHtml) {
       margin: 10pt 0 4pt 0;
       padding-bottom: 2pt;
       border-bottom: 1px solid #333;
-      break-after: avoid-page;
-      page-break-after: avoid;
     }
-    /* Role title + location/date on one row (flex; float breaks in Chromium print PDF) */
     .resume h3 {
       font-size: 10pt;
       font-weight: 600;
       margin: 6pt 0 2pt 0;
-      break-after: avoid-page;
-      page-break-after: avoid;
       display: flex;
       justify-content: space-between;
       align-items: baseline;
@@ -89,22 +88,26 @@ function wrapResumeHtml(bodyHtml) {
       flex-shrink: 1;
       line-height: 1.25;
     }
-    .resume h3 + ul {
-      break-before: avoid;
-      page-break-before: avoid;
+    /* Single-cell table = reliable page-break-inside:avoid in Chromium PDF */
+    .resume-block-shell {
+      width: 100%;
     }
-    .resume p {
-      margin: 2pt 0;
-      orphans: 2;
-      widows: 2;
+    table.resume-block {
+      width: 100%;
+      border-collapse: collapse;
+      border: none;
+      page-break-inside: avoid;
+      break-inside: avoid-page;
     }
-    .resume ul, .resume ol {
-      margin: 2pt 0;
-      padding-left: 16pt;
+    table.resume-block td {
+      border: none;
+      padding: 0;
+      vertical-align: top;
     }
-    .resume li { margin-bottom: 1pt; }
+    .resume p { margin: 2pt 0; orphans: 2; widows: 2; }
+    .resume ul, .resume ol { margin: 2pt 0; padding-left: 16pt; }
+    .resume li { margin-bottom: 1pt; page-break-inside: avoid; break-inside: avoid-page; }
     .resume strong { font-weight: 600; }
-    /* Visible links (markdown [text](url) and linkify'd URLs) */
     .resume a {
       color: #0b57d0;
       text-decoration: underline;
@@ -116,13 +119,7 @@ function wrapResumeHtml(bodyHtml) {
       font-family: Consolas, 'Courier New', monospace;
       font-size: 9pt;
     }
-    /* Markdown --- becomes <hr>; hide so section dividers are only the h2 rule line */
-    .resume hr {
-      display: none;
-      margin: 0;
-      border: none;
-      height: 0;
-    }
+    .resume hr { display: none; margin: 0; border: none; height: 0; }
   </style>
 </head>
 <body>
@@ -132,20 +129,65 @@ function wrapResumeHtml(bodyHtml) {
 }
 
 /**
- * Cover letter wrapper. Same font family as resume so the two documents look
- * like a matched pair, but uses letter-appropriate spacing: bigger margins,
- * larger font, generous line height, and real paragraph breaks. The H1 is
- * styled to mirror the resume's H1 letterhead, so when the candidate name and
- * contact line are pre-pended to the LLM body the header reads identically
- * to the resume.
+ * If a block's top and bottom land on different pages in print layout, push the
+ * whole shell down with margin-top so it starts on the next page.
  */
+async function applyResumePageBreaks(page) {
+  await page.emulateMedia({ media: 'print' });
+  await page.evaluate(() => document.fonts.ready);
+
+  await page.evaluate(({ contentH }) => {
+    const root = document.querySelector('.resume');
+    if (!root) return;
+
+    const shells = [...root.querySelectorAll('.resume-block-shell')];
+    const rootTop = root.getBoundingClientRect().top;
+
+    function pageIndex(y) {
+      return Math.floor((y - rootTop) / contentH);
+    }
+
+    function blockStraddles(el) {
+      const r = el.getBoundingClientRect();
+      if (r.height > contentH) return false;
+      const topPage = pageIndex(r.top);
+      const bottomPage = pageIndex(r.bottom - 0.5);
+      return topPage !== bottomPage;
+    }
+
+    function remainingSpace(y) {
+      const pos = (y - rootTop) % contentH;
+      return pos === 0 ? contentH : contentH - pos;
+    }
+
+    for (let pass = 0; pass < 20; pass++) {
+      let moved = false;
+      for (const shell of shells) {
+        shell.style.marginTop = '';
+      }
+
+      for (const shell of shells) {
+        const r = shell.getBoundingClientRect();
+        const h = r.height;
+        if (h > contentH) continue;
+
+        const straddles = blockStraddles(shell);
+        const space = remainingSpace(r.top);
+        const wontFit = space < h - 0.5 && space < contentH;
+
+        if (straddles || wontFit) {
+          shell.style.marginTop = `${space}px`;
+          moved = true;
+          break;
+        }
+      }
+
+      if (!moved) break;
+    }
+  }, { contentH: RESUME_PAGE_CONTENT_PX });
+}
+
 function wrapCoverLetterHtml(bodyHtml) {
-  // Tightened to guarantee a single-page letter. Margins (0.75in), line-height
-  // (1.45), H1 (16pt to mirror resume), HR bottom margin (14pt), and paragraph
-  // spacing (10pt) all shaved from the previous "letter generous" defaults
-  // because the signature kept overflowing onto page 2 with even mid-length
-  // bodies. Combined with the prompt's 150-200 word ceiling, the full letter
-  // now sits comfortably on one page with room to spare.
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -164,7 +206,6 @@ function wrapCoverLetterHtml(bodyHtml) {
       print-color-adjust: exact;
     }
     .letter { max-width: 7in; }
-    /* Letterhead — mirrors resume H1 styling so the two docs match */
     .letter h1 {
       font-size: 16pt;
       font-weight: 600;
@@ -172,33 +213,11 @@ function wrapCoverLetterHtml(bodyHtml) {
       line-height: 1.15;
       letter-spacing: 0.2pt;
     }
-    /* Optional contact line under the name (rendered when LLM/code emits it as plain paragraph right after H1) */
-    .letter h1 + p {
-      margin: 0 0 4pt 0;
-      font-size: 10pt;
-      color: #444;
-    }
-    /* Divider between letterhead and letter body */
-    .letter hr {
-      border: none;
-      border-top: 1px solid #999;
-      margin: 6pt 0 14pt 0;
-      height: 0;
-    }
-    .letter h2 {
-      font-size: 12pt;
-      font-weight: 600;
-      margin: 12pt 0 5pt 0;
-    }
-    .letter p {
-      margin: 0 0 10pt 0;
-      orphans: 2;
-      widows: 2;
-    }
-    .letter ul, .letter ol {
-      margin: 5pt 0 10pt 0;
-      padding-left: 18pt;
-    }
+    .letter h1 + p { margin: 0 0 4pt 0; font-size: 10pt; color: #444; }
+    .letter hr { border: none; border-top: 1px solid #999; margin: 6pt 0 14pt 0; height: 0; }
+    .letter h2 { font-size: 12pt; font-weight: 600; margin: 12pt 0 5pt 0; }
+    .letter p { margin: 0 0 10pt 0; orphans: 2; widows: 2; }
+    .letter ul, .letter ol { margin: 5pt 0 10pt 0; padding-left: 18pt; }
     .letter li { margin-bottom: 2pt; }
     .letter strong { font-weight: 600; }
     .letter em { font-style: italic; }
@@ -219,7 +238,7 @@ function wrapCoverLetterHtml(bodyHtml) {
 
 /**
  * @param {string} markdown
- * @param {string} [type='resume'] — 'resume' (default, dense layout) or 'cover_letter' (letter layout)
+ * @param {string} [type='resume']
  * @returns {Promise<Buffer>}
  */
 async function markdownToPdf(markdown, type) {
@@ -235,13 +254,17 @@ async function markdownToPdf(markdown, type) {
     throw e;
   }
 
-  const bodyHtml = md.render(raw);
+  const prepared = type === 'cover_letter' ? raw : injectResumeBlockTables(raw);
+  const bodyHtml = md.render(prepared);
   const html = type === 'cover_letter' ? wrapCoverLetterHtml(bodyHtml) : wrapResumeHtml(bodyHtml);
 
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
-    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+    await page.setContent(html, { waitUntil: 'networkidle' });
+    if (type !== 'cover_letter') {
+      await applyResumePageBreaks(page);
+    }
     const pdfBuffer = await page.pdf({
       printBackground: true,
       preferCSSPageSize: true,
@@ -255,4 +278,12 @@ async function markdownToPdf(markdown, type) {
   }
 }
 
-module.exports = { markdownToPdf, getBrowser };
+module.exports = {
+  markdownToPdf,
+  getBrowser,
+  injectResumeBlockTables,
+  applyResumePageBreaks,
+  PAGE_HEIGHT_PX,
+  PAGE_MARGIN_PX,
+  RESUME_PAGE_CONTENT_PX,
+};
